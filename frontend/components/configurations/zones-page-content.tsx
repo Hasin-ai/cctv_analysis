@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { RefreshCcw, Shapes, Slash, Move, Undo2, X, Trash2, Save, Maximize } from "lucide-react";
+import { RefreshCcw, Shapes, Slash, Move, Undo2, X, Trash2, Save, Maximize, Square } from "lucide-react";
 
 import { type DrawMode, type PolygonCanvasHandle, type Pt, type Shape, PolygonCanvas } from "@/components/polygon-canvas";
 import { ANALYTICS_MODES, type AnalyticsMode, PanelCard, StatusPill } from "@/components/v2/ui";
@@ -543,6 +543,11 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
     setDrawingTool("polygon");
   }, []);
 
+  const activateRectangleMode = useCallback(() => {
+    setEditMode(false);
+    setDrawingTool("rectangle");
+  }, []);
+
   const activateEntryLineMode = useCallback(() => {
     setEditMode(false);
     setDrawingTool("entry_line");
@@ -603,6 +608,11 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
         activatePolygonMode();
         return;
       }
+      if (key === "r") {
+        event.preventDefault();
+        activateRectangleMode();
+        return;
+      }
       if (key === "l") {
         event.preventDefault();
         if (event.shiftKey) activateExitLineMode();
@@ -624,7 +634,7 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
     return () => {
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [activateEntryLineMode, activateExitLineMode, activatePolygonMode, saveCanvasImage, toggleCanvasEditMode, toggleCanvasFullscreen]);
+  }, [activateEntryLineMode, activateExitLineMode, activatePolygonMode, activateRectangleMode, saveCanvasImage, toggleCanvasEditMode, toggleCanvasFullscreen]);
 
   function resetDraft() {
     canvasRef.current?.loadPolygons(savedCanvasShapes);
@@ -976,11 +986,12 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
                 className="h-10 w-full rounded-lg border border-input bg-white px-3 text-sm text-foreground"
               >
                 <option value="polygon">Zone Polygon Tool</option>
+                <option value="rectangle">Rectangle Tool</option>
                 <option value="entry_line">Entry Line Tool</option>
                 <option value="exit_line">Exit Line Tool</option>
               </select>
               <p className="mt-1 text-[11px] text-muted-foreground">
-                Current interaction: {editMode ? "Edit Mode" : drawingTool === "polygon" ? "Polygon Mode" : drawingTool === "entry_line" ? "Entry Line Mode" : "Exit Line Mode"}
+                Current interaction: {editMode ? "Edit Mode" : drawingTool === "polygon" ? "Polygon Mode" : drawingTool === "rectangle" ? "Rectangle Mode" : drawingTool === "entry_line" ? "Entry Line Mode" : "Exit Line Mode"}
               </p>
             </div>
 
@@ -1104,6 +1115,18 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
                 >
                   <Shapes className="mb-1.5 h-5 w-5" />
                   <span className="text-center leading-tight">Polygon Mode<br/>(P)</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={activateRectangleMode}
+                  className={`flex flex-col items-center justify-center border-l border-white/20 px-4 py-3 min-w-[80px] sm:min-w-0 flex-1 text-[10px] sm:text-[11px] font-semibold transition whitespace-nowrap ${
+                    !editMode && drawingTool === "rectangle"
+                      ? "bg-white text-[#8622FF]"
+                      : "bg-transparent text-white hover:bg-white/10"
+                  }`}
+                >
+                  <Square className="mb-1.5 h-5 w-5" />
+                  <span className="text-center leading-tight">Rectangle<br/>(R)</span>
                 </button>
                 <button
                   type="button"

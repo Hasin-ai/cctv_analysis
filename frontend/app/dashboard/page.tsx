@@ -24,11 +24,13 @@ const ANALYTICS_MODES: { id: AnalyticsMode; label: string; desc: string }[] = [
 import {
   CameraFeed,
   MiniLineChart,
+  MultiZoneLineChart,
   PanelCard,
   StatTile,
   StatusPill
 } from "@/components/v2/ui";
 import { PersonReidAnalyticsPanel } from "@/components/v2/person-reid-analytics-panel";
+import { ZoneQuickEditor } from "@/components/v2/zone-quick-editor";
 
 type TimelinePoint = {
   ts: number;
@@ -116,6 +118,82 @@ function EntryExitAnalyticsPanel({
     });
   }, [footfall, searchQuery, selectedZoneId, liveZones]);
 
+  const seriesByZone = useMemo(() => {
+    if (!footfall) return [];
+    
+    // Group series by zone
+    const map = new Map<number | null, typeof footfall.series>();
+    for (const pt of footfall.series) {
+      if (!map.has(pt.zone_id)) map.set(pt.zone_id, []);
+      map.get(pt.zone_id)!.push(pt);
+    }
+    
+    // Convert to target format
+    const results = Array.from(map.entries()).map(([zId, pts]) => {
+      const recent = pts.slice(-36);
+      
+      const netSeries = recent.reduce<number[]>((acc, p) => {
+        const prev = acc[acc.length - 1] ?? 0;
+        acc.push(prev + p.net_count);
+        return acc;
+      }, []);
+
+      const zName = footfall.zone_totals?.find(t => t.zone_id === zId)?.zone_name ?? (zId === null ? "Global Tracking" : `Zone ${zId}`);
+      
+      const colors = ["#0f766e", "#ea580c", "#1d4ed8", "#dc2626", "#7c3aed", "#15803d"];
+      const cIdx = zId ? zId % colors.length : 0;
+      
+      return {
+        id: zId ?? "global",
+        name: zName,
+        color: colors[cIdx],
+        entryValues: recent.map(p => p.entry_count),
+        exitValues: recent.map(p => p.exit_count),
+        netValues: netSeries,
+      };
+    });
+    
+    // Apply filters
+    if (selectedZoneId && selectedZoneId !== "all") {
+        const zNum = Number(selectedZoneId);
+        return results.filter(r => r.id === zNum);
+    }
+    return results;
+  }, [footfall, selectedZoneId]);
+
+  const peakHourStr = useMemo(() => {
+    if (!footfall || footfall.series.length === 0) return "N/A";
+    const hourlyVolumes = new Map<string, number>();
+    
+    for (const pt of footfall.series) {
+      // Respect zone filtering
+      if (selectedZoneId && selectedZoneId !== "all" && pt.zone_id !== Number(selectedZoneId)) {
+        continue;
+      }
+      
+      const date = new Date(pt.timestamp);
+      if (Number.isNaN(date.getTime())) continue;
+      
+      // Standardize hour bucketing strings e.g. "02:00 PM"
+      const hourStr = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true }).replace(/:\d{2}/, ':00');
+      
+      const count = pt.entry_count + pt.exit_count;
+      hourlyVolumes.set(hourStr, (hourlyVolumes.get(hourStr) || 0) + count);
+    }
+    
+    if (hourlyVolumes.size === 0) return "N/A";
+    
+    let peak = "N/A";
+    let max = -1;
+    for (const [hr, vol] of hourlyVolumes.entries()) {
+      if (vol > max) {
+        max = vol;
+        peak = hr;
+      }
+    }
+    return max > 0 ? `${peak}` : "N/A";
+  }, [footfall, selectedZoneId]);
+
   if (!footfall) {
     return <p className="text-sm text-muted-foreground">No entry/exit analytics available yet for this camera.</p>;
   }
@@ -123,49 +201,72 @@ function EntryExitAnalyticsPanel({
     return <p className="text-sm text-muted-foreground">No real entry/exit events recorded yet for this camera.</p>;
   }
 
-  const recent = footfall.series.slice(-36);
-  const entrySeries = recent.map((point) => point.entry_count);
-  const exitSeries = recent.map((point) => point.exit_count);
   const liveByZoneId = new Map<number, number>();
   for (const zone of liveZones) {
     liveByZoneId.set(zone.zone_id, zone.person_count);
   }
-  const netSeries = recent.reduce<number[]>((acc, point) => {
-    const prev = acc[acc.length - 1] ?? 0;
-    acc.push(prev + point.net_count);
-    return acc;
-  }, []);
 
   return (
     <div className="space-y-3">
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
         <StatTile label="Total Entries" value={footfall.total_entries} hint="Tracked with ByteTrack IDs" />
         <StatTile label="Total Exits" value={footfall.total_exits} hint="Tracked with ByteTrack IDs" />
         <StatTile label="Net Flow" value={footfall.net_flow} hint="Entries minus exits" />
+        <StatTile label="Peak Hour" value={peakHourStr} hint="Highest traffic window" />
         <StatTile label="Estimated Occupancy" value={Math.max(footfall.net_flow, 0)} hint="Derived occupancy trend" />
       </div>
 
       <div className="grid gap-3 lg:grid-cols-3">
         <div className="rounded-xl border border-border/70 bg-white/80 p-3">
-          <p className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">Entry Trend</p>
-          {entrySeries.length > 0 ? (
-            <MiniLineChart values={entrySeries} />
+          <p className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">Entry Trend (Multi-Zone)</p>
+          {seriesByZone.length > 0 ? (
+            <div className="mb-2 space-y-2">
+              <MultiZoneLineChart series={seriesByZone.map(s => ({ id: s.id, name: s.name, color: s.color, values: s.entryValues }))} />
+              <div className="flex flex-wrap gap-2 text-[10px] font-semibold">
+                {seriesByZone.map(s => (
+                  <div key={s.id} className="flex items-center gap-1">
+                    <div className="h-2 w-2 rounded-full" style={{ backgroundColor: s.color }} />
+                    <span className="text-muted-foreground">{s.name}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
           ) : (
             <p className="text-xs text-muted-foreground">No trend points yet.</p>
           )}
         </div>
         <div className="rounded-xl border border-border/70 bg-white/80 p-3">
-          <p className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">Exit Trend</p>
-          {exitSeries.length > 0 ? (
-            <MiniLineChart values={exitSeries} />
+          <p className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">Exit Trend (Multi-Zone)</p>
+          {seriesByZone.length > 0 ? (
+            <div className="mb-2 space-y-2">
+              <MultiZoneLineChart series={seriesByZone.map(s => ({ id: s.id, name: s.name, color: s.color, values: s.exitValues }))} />
+              <div className="flex flex-wrap gap-2 text-[10px] font-semibold">
+                {seriesByZone.map(s => (
+                  <div key={s.id} className="flex items-center gap-1">
+                    <div className="h-2 w-2 rounded-full" style={{ backgroundColor: s.color }} />
+                    <span className="text-muted-foreground">{s.name}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
           ) : (
             <p className="text-xs text-muted-foreground">No trend points yet.</p>
           )}
         </div>
         <div className="rounded-xl border border-border/70 bg-white/80 p-3">
-          <p className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">Net Trend</p>
-          {netSeries.length > 0 ? (
-            <MiniLineChart values={netSeries} />
+          <p className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">Net Trend / Occupancy</p>
+          {seriesByZone.length > 0 ? (
+            <div className="mb-2 space-y-2">
+              <MultiZoneLineChart series={seriesByZone.map(s => ({ id: s.id, name: s.name, color: s.color, values: s.netValues }))} />
+              <div className="flex flex-wrap gap-2 text-[10px] font-semibold">
+                {seriesByZone.map(s => (
+                  <div key={s.id} className="flex items-center gap-1">
+                    <div className="h-2 w-2 rounded-full" style={{ backgroundColor: s.color }} />
+                    <span className="text-muted-foreground">{s.name}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
           ) : (
             <p className="text-xs text-muted-foreground">No trend points yet.</p>
           )}
@@ -239,6 +340,19 @@ export default function DashboardPage() {
   const [footfallByCamera, setFootfallByCamera] = useState<Record<number, FootfallResponse>>({});
   const [searchQuery, setSearchQuery] = useState("");
   const [analyticsSearchQuery, setAnalyticsSearchQuery] = useState("");
+  const [timeRange, setTimeRange] = useState<"12h" | "today" | "24h">("today");
+  const [showZoneEditor, setShowZoneEditor] = useState(false);
+
+  const getStartTimestamp = useCallback(() => {
+    if (timeRange === "12h") return hoursAgoIso(12);
+    if (timeRange === "24h") return hoursAgoIso(24);
+    if (timeRange === "today") {
+       const d = new Date();
+       d.setHours(0, 0, 0, 0);
+       return d.toISOString();
+    }
+    return hoursAgoIso(12);
+  }, [timeRange]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -316,7 +430,7 @@ export default function DashboardPage() {
       const payload = await getFootfall({
         cameraId,
         zoneId: zoneId !== "all" ? Number(zoneId) : undefined,
-        start: hoursAgoIso(12),
+        start: getStartTimestamp(),
       });
       setFootfallByCamera((previous) => ({
         ...previous,
@@ -325,7 +439,7 @@ export default function DashboardPage() {
     } catch {
       // Keep latest successful analytics payload in the dashboard.
     }
-  }, []);
+  }, [getStartTimestamp]);
 
   useEffect(() => {
     if (!selectedCameraId) return;
@@ -510,6 +624,16 @@ export default function DashboardPage() {
             subtitle="Live feed and detection overlay while analytics is running"
             right={
               <div className="flex items-center gap-2">
+                {selected ? (
+                  <button
+                    type="button"
+                    onClick={() => setShowZoneEditor(true)}
+                    className="flex items-center rounded-lg border border-primary/40 bg-primary/10 px-3 py-1.5 text-xs font-semibold text-primary transition hover:bg-primary/20 whitespace-nowrap"
+                  >
+                    <Pencil className="mr-1.5 h-3.5 w-3.5" />
+                    Quick-Edit Zones
+                  </button>
+                ) : null}
                 <select
                   value={overlayMode}
                   onChange={(e) => setOverlayMode(e.target.value as AnalyticsMode)}
@@ -609,15 +733,26 @@ export default function DashboardPage() {
               <Filter className="h-5 w-5 text-primary" />
               <h3 className="font-semibold text-foreground">Analytics Data</h3>
             </div>
-            <div className="relative w-48 sm:w-64">
-              <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
-              <input
-                type="text"
-                placeholder="Search analytics by zone..."
-                value={analyticsSearchQuery}
-                onChange={(e) => setAnalyticsSearchQuery(e.target.value)}
-                className="h-9 w-full rounded-lg border border-input bg-white pl-9 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary"
-              />
+            <div className="flex items-center gap-3">
+              <select
+                value={timeRange}
+                onChange={(e) => setTimeRange(e.target.value as "12h" | "today" | "24h")}
+                className="h-9 rounded-lg border border-input bg-white px-3 text-xs text-foreground shadow-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+              >
+                <option value="12h">Last 12 Hours</option>
+                <option value="24h">Last 24 Hours</option>
+                <option value="today">Today</option>
+              </select>
+              <div className="relative w-48 sm:w-64">
+                <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+                <input
+                  type="text"
+                  placeholder="Search analytics by zone..."
+                  value={analyticsSearchQuery}
+                  onChange={(e) => setAnalyticsSearchQuery(e.target.value)}
+                  className="h-9 w-full rounded-lg border border-input bg-white pl-9 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+                />
+              </div>
             </div>
           </div>
 
@@ -642,6 +777,16 @@ export default function DashboardPage() {
             </PanelCard>
           </div>
         </div>
+      ) : null}
+
+      {showZoneEditor && selected ? (
+        <ZoneQuickEditor
+          cameraId={selected.camera.id}
+          cameraName={selected.camera.name}
+          frameUrl={`/api/backend/api/monitoring/cameras/${selected.camera.id}/${selected.type === "Video File" ? "first-frame" : "source-frame"}`}
+          onClose={() => setShowZoneEditor(false)}
+          onZonesUpdated={() => void loadZones(selected.camera.id)}
+        />
       ) : null}
     </div>
   );

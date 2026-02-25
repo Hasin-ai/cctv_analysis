@@ -42,8 +42,6 @@ export function ZoneQuickEditor({
   const [imageSize, setImageSize] = useState<{ width: number; height: number } | null>(null);
   
   const [zoneName, setZoneName] = useState("Zone A");
-  const [zoneCapacity, setZoneCapacity] = useState("");
-  const [zoneExpectedWaitTime, setZoneExpectedWaitTime] = useState("");
   const [zoneColor, setZoneColor] = useState(ZONE_COLORS[0]);
   const [isCreatingZone, setIsCreatingZone] = useState(true);
   
@@ -68,8 +66,6 @@ export function ZoneQuickEditor({
     const active = selectedZones.find((z) => z.id === selectedZoneId);
     if (!active) return;
     setZoneName(active.name);
-    setZoneCapacity(active.capacity ? active.capacity.toString() : "");
-    setZoneExpectedWaitTime(active.expected_wait_time_sec ? active.expected_wait_time_sec.toString() : "");
     const polyRecord = active.polygon as Record<string, unknown> | undefined;
     const color = polyRecord?.color;
     setZoneColor(typeof color === "string" ? color : ZONE_COLORS[0]);
@@ -180,22 +176,18 @@ export function ZoneQuickEditor({
       const draftEntry = unsavedShapes.find(s => s.mode === "entry_line");
       const draftExit = unsavedShapes.find(s => s.mode === "exit_line");
       
-      const parsedCapacity = zoneCapacity.trim() ? parseInt(zoneCapacity.trim(), 10) : null;
-      const parsedWaitTime = zoneExpectedWaitTime.trim() ? parseInt(zoneExpectedWaitTime.trim(), 10) : null;
       await createZone(cameraId, zoneName.trim(), {
         color: zoneColor,
         points: payloadPolygons[0] || [], 
         polygons: payloadPolygons,
         entry_line: draftEntry ? { points: draftEntry.points.map(([x, y]) => ({ x: toNormalizedCoordinate(x, maxX), y: toNormalizedCoordinate(y, maxY) })) } : undefined,
         exit_line: draftExit ? { points: draftExit.points.map(([x, y]) => ({ x: toNormalizedCoordinate(x, maxX), y: toNormalizedCoordinate(y, maxY) })) } : undefined,
-      }, parsedCapacity, parsedWaitTime);
+      });
 
       await refreshZones();
       onZonesUpdated();
       setIsCreatingZone(true);
       setZoneName((previous) => (previous.toLowerCase().endsWith("a") ? "Zone B" : "Zone A"));
-      setZoneCapacity("");
-      setZoneExpectedWaitTime("");
       activatePolygonMode();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to save zone");
@@ -229,22 +221,6 @@ export function ZoneQuickEditor({
                 className="w-full rounded-md border p-2 text-sm"
                 placeholder="Zone Name"
               />
-              <input
-                type="number"
-                min="1"
-                value={zoneCapacity}
-                onChange={(e) => setZoneCapacity(e.target.value)}
-                className="w-full rounded-md border p-2 text-sm"
-                placeholder="Optional capacity limit"
-              />
-              <input
-                type="number"
-                min="1"
-                value={zoneExpectedWaitTime}
-                onChange={(e) => setZoneExpectedWaitTime(e.target.value)}
-                className="w-full rounded-md border p-2 text-sm"
-                placeholder="Wait Time Target (sec)"
-              />
               <div className="flex flex-wrap gap-2">
                 {ZONE_COLORS.map(c => (
                   <button key={c} onClick={() => setZoneColor(c)} className={`h-6 w-6 rounded-full border-2 ${zoneColor === c ? "border-slate-800" : "border-transparent"}`} style={{ backgroundColor: c }} />
@@ -253,7 +229,7 @@ export function ZoneQuickEditor({
             </div>
 
             <div className="space-y-2">
-              <button onClick={() => { setIsCreatingZone(true); setSelectedZoneId(null); setPolygons(savedCanvasShapes); activatePolygonMode(); setZoneCapacity(""); setZoneExpectedWaitTime(""); setZoneName("Zone A"); }} className="w-full rounded bg-primary/10 py-2 text-sm font-semibold text-primary">
+              <button onClick={() => { setIsCreatingZone(true); setSelectedZoneId(null); setPolygons(savedCanvasShapes); activatePolygonMode(); }} className="w-full rounded bg-primary/10 py-2 text-sm font-semibold text-primary">
                 + New Zone
               </button>
               <button 

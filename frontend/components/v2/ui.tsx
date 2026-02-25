@@ -463,6 +463,52 @@ export function MiniLineChart({ values, className }: { values: number[]; classNa
   );
 }
 
+export function MultiZoneLineChart({
+  series,
+  className,
+}: {
+  series: { id: string | number; name: string; color: string; values: number[] }[];
+  className?: string;
+}) {
+  const width = 420;
+  const height = 110;
+  
+  // Find global max to scale properly across all overlapping graph sets
+  const allValues = series.flatMap(s => s.values);
+  const max = Math.max(...allValues, 1);
+  const min = Math.min(...allValues, 0);
+  const span = Math.max(max - min, 1);
+
+  return (
+    <div className="relative">
+      <svg viewBox={`0 0 ${width} ${height}`} className={cn("h-[110px] w-full", className)}>
+        {series.map((line) => {
+          if (line.values.length === 0) return null;
+          
+          const points = line.values
+            .map((value, index) => {
+              const x = (index / Math.max(line.values.length - 1, 1)) * width;
+              const y = height - ((value - min) / span) * (height - 10) - 5;
+              return `${x},${y}`;
+            })
+            .join(" ");
+
+          return (
+            <polyline
+              key={line.id}
+              points={points}
+              fill="none"
+              stroke={line.color}
+              strokeWidth="2.4"
+              opacity="0.85"
+            />
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
 export function MiniBarChart({ values, className }: { values: number[]; className?: string }) {
   const width = 420;
   const height = 110;
