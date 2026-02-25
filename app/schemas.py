@@ -71,8 +71,6 @@ class ZoneCreate(BaseModel):
     camera_id: int
     name: str = Field(..., min_length=1)
     polygon: dict
-    capacity: int | None = None
-    expected_wait_time_sec: int | None = None
 
 
 class ZoneRead(BaseModel):
@@ -80,8 +78,6 @@ class ZoneRead(BaseModel):
     camera_id: int
     name: str
     polygon: dict
-    capacity: int | None = None
-    expected_wait_time_sec: int | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -105,30 +101,6 @@ class FootfallZoneTotal(BaseModel):
     net_flow: int = 0
 
 
-class PeakPersonCountHour(BaseModel):
-    hour_start: str | None = None
-    hour_end: str | None = None
-    person_count: int = 0
-    zone_id: int | None = None
-    zone_name: str | None = None
-
-
-class PeakTrafficHour(BaseModel):
-    hour_start: str | None = None
-    hour_end: str | None = None
-    traffic_count: int = 0
-
-
-class MostCrowdedQuarter(BaseModel):
-    quarter_index: int | None = None
-    quarter_label: str | None = None
-    start_time: str | None = None
-    end_time: str | None = None
-    person_count: int = 0
-    zone_id: int | None = None
-    zone_name: str | None = None
-
-
 class FootfallResponse(BaseModel):
     camera_id: int
     zone_id: int | None
@@ -138,25 +110,6 @@ class FootfallResponse(BaseModel):
     net_flow: int
     series: list[FootfallSeriesPoint]
     zone_totals: list[FootfallZoneTotal] = Field(default_factory=list)
-    video_available_seconds: int = 0
-    video_available_hours: float = 0.0
-    peak_traffic_hour: PeakTrafficHour | None = None
-    peak_person_count_hour: PeakPersonCountHour | None = None
-    source_type: str = "rtsp"
-    most_crowded_quarter: MostCrowdedQuarter | None = None
-
-
-class ZoneAnalysisResponse(BaseModel):
-    camera_id: int
-    zone_id: int | None = None
-    start_time: str | None = None
-    end_time: str | None = None
-    frame_interval_seconds: float = 1.0
-    congestion_by_zone: list[dict] = Field(default_factory=list)
-    tracked_paths: list[dict] = Field(default_factory=list)
-    heatmaps: list[dict] = Field(default_factory=list)
-    service_staff_presence: list[dict] = Field(default_factory=list)
-    summary: dict = Field(default_factory=dict)
 
 
 class SegmentRead(BaseModel):
@@ -180,8 +133,6 @@ class ReconstructionCreate(BaseModel):
     overlay_lines: list[str] = Field(default_factory=list, max_length=8)
     analysis_job_id: int | None = None
     draw_tracking: bool = False
-    draw_facial_expression: bool = False
-    facial_expression_zone_id: int | None = None
 
 
 class ReconstructionRead(BaseModel):

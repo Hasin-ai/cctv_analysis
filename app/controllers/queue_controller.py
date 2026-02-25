@@ -22,9 +22,7 @@ def get_queue_service() -> QueueManagementService:
 
 def _parse_datetime(value: str) -> datetime:
     cleaned = value.replace("Z", "+00:00")
-    dt = datetime.fromisoformat(cleaned)
-    # Strip tzinfo to create a naive datetime (assuming UTC input) for SQLite compatibility
-    return dt.replace(tzinfo=None)
+    return datetime.fromisoformat(cleaned)
 
 
 async def get_queue_status():
@@ -70,8 +68,6 @@ async def list_zones_for_queue(session: AsyncSession, camera_id: int):
             "id": zone.id,
             "name": zone.name,
             "polygon": zone.polygon,
-            "capacity": zone.capacity,
-            "expected_wait_time_sec": zone.expected_wait_time_sec,
             "created_at": zone.created_at.isoformat(),
         }
         for zone in zones
@@ -115,7 +111,6 @@ async def start_queue_analysis(
 
     service = get_queue_service()
     zone_polygon = zone.polygon
-    zone_capacity = zone.capacity  # capacity-overflow model from main_heatmap_multi.py
 
     async def run_job():
         from app.db.session import AsyncSessionLocal
@@ -129,7 +124,6 @@ async def start_queue_analysis(
                 request.zone_id,
                 zone_polygon,
                 bg_frames,
-                zone_capacity=zone_capacity,
             )
 
     background_tasks.add_task(run_job)
@@ -165,41 +159,6 @@ async def get_queue_results(session: AsyncSession, job_id: int):
     frame_results = await crud.get_queue_results_for_job(session, job_id)
     zones = await crud.list_zones(session, camera_id=job.camera_id)
     zone_map = {zone.id: zone.name for zone in zones}
-    zone_obj = next((z for z in zones if z.id == job.zone_id), None)
-    zone_capacity = zone_obj.capacity if zone_obj else None
-
-    serialized_frame_results = [
-        {
-            "timestamp": result.timestamp.isoformat(),
-            "queue_count": result.queue_count,
-            "wait_time_sec": result.wait_time_sec,
-            "throughput_exits_per_sec": result.throughput_exits_per_sec,
-        }
-        for result in frame_results
-    ]
-    current_line_length = serialized_frame_results[-1]["queue_count"] if serialized_frame_results else None
-
-    max_queue = job.max_queue_count
-    avg_queue = job.avg_queue_count
-    avg_wait = job.avg_wait_time_sec
-    avg_throughput = job.avg_throughput_exits_per_sec
-    
-    if job.status.value != "completed" and serialized_frame_results:
-        counts = [r["queue_count"] for r in serialized_frame_results]
-        waits = [r["wait_time_sec"] for r in serialized_frame_results if r["wait_time_sec"] is not None]
-        throughputs = [r["throughput_exits_per_sec"] for r in serialized_frame_results if r["throughput_exits_per_sec"] is not None]
-        
-        max_queue = max(counts) if counts else 0
-        avg_queue = sum(counts) / len(counts) if counts else 0.0
-        if waits:
-            avg_wait = sum(waits) / len(waits)
-        if throughputs:
-            avg_throughput = sum(throughputs) / len(throughputs)
-
-    # Capacity-overflow stats
-    number_over_capacity = None
-    if zone_capacity is not None and zone_capacity > 0 and current_line_length is not None:
-        number_over_capacity = max(0, current_line_length - zone_capacity)
 
     return {
         "job_id": job.id,
@@ -207,14 +166,15 @@ async def get_queue_results(session: AsyncSession, job_id: int):
         "zone_id": job.zone_id,
         "zone_name": zone_map.get(job.zone_id),
         "status": job.status.value,
-        "max_queue_count": max_queue,
-        "avg_queue_count": avg_queue,
-        "avg_line_length": avg_queue,
-        "current_line_length": current_line_length,
-        "avg_wait_time_sec": avg_wait,
-        "avg_throughput_exits_per_sec": avg_throughput,
-        "number_over_capacity": number_over_capacity,
-        "frame_results": serialized_frame_results,
+        "max_queue_count": job.max_queue_count,
+        "avg_queue_count": job.avg_queue_count,
+        "frame_results": [
+            {
+                "timestamp": result.timestamp.isoformat(),
+                "queue_count": result.queue_count,
+            }
+            for result in frame_results
+        ],
     }
 
 
@@ -230,8 +190,7 @@ def _job_to_response(job) -> QueueJobResponse:
         processed_frames=job.processed_frames,
         max_queue_count=job.max_queue_count,
         avg_queue_count=job.avg_queue_count,
-        avg_wait_time_sec=job.avg_wait_time_sec,
-        avg_throughput_exits_per_sec=job.avg_throughput_exits_per_sec,
         error=job.error,
         created_at=job.created_at.isoformat(),
     )
+

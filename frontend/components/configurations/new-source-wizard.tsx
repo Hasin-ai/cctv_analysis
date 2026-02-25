@@ -79,10 +79,9 @@ export function NewSourceWizard({ onWizardComplete }: { onWizardComplete?: (comp
   } = useSourcesData({ enableRealtime: false, pollCoreMs: 60000 });
 
   const [step, setStep] = useState(1);
-  const [sourceType, setSourceType] = useState<"rtsp" | "file" | "webcam">("rtsp");
+  const [sourceType, setSourceType] = useState<"rtsp" | "file">("rtsp");
   const [sourceName, setSourceName] = useState("");
   const [rtspUrl, setRtspUrl] = useState("");
-  const [webcamId, setWebcamId] = useState("0");
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [fileName, setFileName] = useState("");
   const [isDragOver, setIsDragOver] = useState(false);
@@ -113,10 +112,7 @@ export function NewSourceWizard({ onWizardComplete }: { onWizardComplete?: (comp
 
     setSourceName(editingCamera.name);
     if (editingCamera.rtsp_url) {
-      if (editingCamera.rtsp_url.startsWith("webcam://")) {
-        setSourceType("webcam");
-        setWebcamId(editingCamera.rtsp_url.replace("webcam://", ""));
-      } else if (isRtspLikeUrl(editingCamera.rtsp_url)) {
+      if (isRtspLikeUrl(editingCamera.rtsp_url)) {
         setSourceType("rtsp");
         setRtspUrl(editingCamera.rtsp_url);
       } else {
@@ -132,7 +128,6 @@ export function NewSourceWizard({ onWizardComplete }: { onWizardComplete?: (comp
   function stepOneValid() {
     if (!sourceName.trim()) return false;
     if (sourceType === "rtsp") return isRtspLikeUrl(rtspUrl);
-    if (sourceType === "webcam") return webcamId.trim().length > 0;
     if (videoFile) return true;
     return Boolean(editingId && fileName.trim().length > 0);
   }
@@ -168,7 +163,6 @@ export function NewSourceWizard({ onWizardComplete }: { onWizardComplete?: (comp
         name: sourceName,
         sourceType,
         rtspUrl,
-        webcamId,
         file: sourceType === "file" ? videoFile : null,
         fileName,
         scheduleLabel: scheduleSummary({
@@ -255,17 +249,6 @@ export function NewSourceWizard({ onWizardComplete }: { onWizardComplete?: (comp
               >
                 Video Upload
               </button>
-              <button
-                type="button"
-                onClick={() => setSourceType("webcam")}
-                className={`rounded-lg border px-3 py-1.5 text-xs font-semibold ${
-                  sourceType === "webcam"
-                    ? "border-primary bg-primary text-primary-foreground"
-                    : "border-border bg-white text-foreground"
-                }`}
-              >
-                Webcam
-              </button>
             </div>
 
             {sourceType === "rtsp" ? (
@@ -278,17 +261,6 @@ export function NewSourceWizard({ onWizardComplete }: { onWizardComplete?: (comp
                   className="h-10 w-full rounded-lg border border-input bg-white px-3 text-sm text-foreground outline-none"
                 />
                 <p className="mt-1 text-[11px] text-muted-foreground">Supports `rtsp://` and `rtsps://` URLs.</p>
-              </div>
-            ) : sourceType === "webcam" ? (
-              <div>
-                <label className="mb-1 block text-xs font-semibold text-muted-foreground">Webcam Device Index or Path</label>
-                <input
-                  value={webcamId}
-                  onChange={(event) => setWebcamId(event.target.value)}
-                  placeholder="0 or /dev/video0"
-                  className="h-10 w-full rounded-lg border border-input bg-white px-3 text-sm text-foreground outline-none"
-                />
-                <p className="mt-1 text-[11px] text-muted-foreground">E.g., `0` for default Mac webcam, `/dev/video0` on Linux.</p>
               </div>
             ) : (
               <label
@@ -410,8 +382,8 @@ export function NewSourceWizard({ onWizardComplete }: { onWizardComplete?: (comp
               <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">Summary</p>
               <div className="mt-2 space-y-1 text-foreground">
                 <p><strong>Name:</strong> {sourceName || "-"}</p>
-                <p><strong>Type:</strong> {sourceType === "rtsp" ? "RTSP URL" : sourceType === "webcam" ? "Webcam" : "Video File"}</p>
-                <p><strong>Source:</strong> {sourceType === "rtsp" ? rtspUrl || "-" : sourceType === "webcam" ? (webcamId || "0") : fileName || "-"}</p>
+                <p><strong>Type:</strong> {sourceType === "rtsp" ? "RTSP URL" : "Video File"}</p>
+                <p><strong>Source:</strong> {sourceType === "rtsp" ? rtspUrl || "-" : fileName || "-"}</p>
 
                 <p>
                   <strong>Schedule:</strong>{" "}

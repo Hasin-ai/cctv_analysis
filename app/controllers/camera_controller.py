@@ -14,8 +14,7 @@ from app.db import crud
 from app.db.models import StreamStatus
 from app.schemas import CameraCreate, CameraUpdate
 
-_INGESTION_STOP_TIMEOUT_SECONDS = 3.0
-_INGESTION_FORCE_STOP_AFTER_SECONDS = 0.75
+_INGESTION_STOP_TIMEOUT_SECONDS = 8.0
 _INGESTION_STOP_POLL_SECONDS = 0.1
 
 
@@ -179,14 +178,8 @@ async def _wait_for_ingestion_stop(services: ServiceContainer, stream_id: int) -
     ingestion_manager.stop_ingestion(stream_id)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _INGESTION_STOP_TIMEOUT_SECONDS
-    force_stop_after = loop.time() + _INGESTION_FORCE_STOP_AFTER_SECONDS
-    forced = False
     while ingestion_manager.is_running(stream_id):
-        now = loop.time()
-        if not forced and now >= force_stop_after:
-            ingestion_manager.force_stop_ingestion(stream_id)
-            forced = True
-        if now >= deadline:
+        if loop.time() >= deadline:
             raise HTTPException(
                 status_code=503,
                 detail="Capture worker is still stopping. Retry in a few seconds.",

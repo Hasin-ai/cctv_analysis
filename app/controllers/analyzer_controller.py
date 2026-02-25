@@ -1,11 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import logging
-import time
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
-from typing import Any
 
 from fastapi import BackgroundTasks, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,19 +13,13 @@ from app.db.session import AsyncSessionLocal
 from app.models.analyzer import (
     AnalysisJobResponse,
     AnalysisRequest,
-    FacialExpressionRecognitionRequest,
     TotalPersonDetectionRequest,
 )
-from app.services.facial_expression_recognition import FacialExpressionRecognitionService
 from app.services.person_tracking import PersonTrackingService
 from app.services.total_person_detection import TotalPersonDetectionService
 
 _tracking_service: PersonTrackingService | None = None
 _total_person_service: TotalPersonDetectionService | None = None
-_FACIAL_EXPRESSION_RETRY_SECONDS = 30.0
-_facial_expression_service: FacialExpressionRecognitionService | None = None
-_facial_expression_retry_after_monotonic = 0.0
-logger = logging.getLogger(__name__)
 
 
 def get_tracking_service() -> PersonTrackingService:
@@ -46,29 +36,6 @@ def get_total_person_service() -> TotalPersonDetectionService:
     return _total_person_service
 
 
-def get_facial_expression_service() -> FacialExpressionRecognitionService:
-    global _facial_expression_service, _facial_expression_retry_after_monotonic
-
-    now = time.monotonic()
-    should_initialize = _facial_expression_service is None
-    should_retry = (
-        _facial_expression_service is not None
-        and not _facial_expression_service.is_available()
-        and now >= _facial_expression_retry_after_monotonic
-    )
-    if should_initialize or should_retry:
-        _facial_expression_service = FacialExpressionRecognitionService()
-        if not _facial_expression_service.is_available():
-            _facial_expression_retry_after_monotonic = now + _FACIAL_EXPRESSION_RETRY_SECONDS
-            logger.warning(
-                "Facial expression analyzer unavailable; will retry initialization in %.0f seconds",
-                _FACIAL_EXPRESSION_RETRY_SECONDS,
-            )
-        else:
-            _facial_expression_retry_after_monotonic = 0.0
-    return _facial_expression_service
-
-
 def _parse_datetime(value: str) -> datetime:
     cleaned = value.replace("Z", "+00:00")
     return datetime.fromisoformat(cleaned)
@@ -78,35 +45,6 @@ def _to_utc_naive(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value
     return value.astimezone(timezone.utc).replace(tzinfo=None)
-
-
-def _extract_zone_polygons(polygon_payload: Any) -> list[list[Any]]:
-    if isinstance(polygon_payload, dict):
-        raw_polygons = polygon_payload.get("polygons")
-        if isinstance(raw_polygons, list):
-            return [poly for poly in raw_polygons if isinstance(poly, list)]
-        points = polygon_payload.get("points")
-        if isinstance(points, list):
-            return [points]
-        return []
-
-    if isinstance(polygon_payload, list):
-        if polygon_payload and isinstance(polygon_payload[0], list):
-            return [poly for poly in polygon_payload if isinstance(poly, list)]
-        return [polygon_payload]
-
-    return []
-
-
-def _zone_filter_from_zones(zones: list[Any]) -> Any | None:
-    polygons: list[list[Any]] = []
-    for zone in zones:
-        polygons.extend(_extract_zone_polygons(getattr(zone, "polygon", None)))
-
-    if not polygons:
-        return None
-
-    return SimpleNamespace(polygon={"polygons": polygons})
 
 
 async def get_analyzer_status():
@@ -298,74 +236,6 @@ async def detect_total_persons(
         "avg_person_count": float(result.get("avg_person_count", 0.0)),
         "series": result.get("series", []),
     }
-
-
-async def detect_facial_expressions(
-    session: AsyncSession,
-    request: FacialExpressionRecognitionRequest,
-):
-    if not fetcher_enabled():
-        raise HTTPException(status_code=503, detail="Facial expression recognition available only on fetcher service")
-
-    camera = await crud.get_camera(session, request.camera_id)
-    if not camera:
-        raise HTTPException(status_code=404, detail="Camera not found")
-
-    zones_for_camera = await crud.list_zones(session, camera_id=request.camera_id)
-    zone = None
-    zone_name: str | None = None
-    if request.zone_id is not None:
-        zone = await crud.get_zone(session, request.zone_id)
-        if not zone or int(zone.camera_id) != int(request.camera_id):
-            raise HTTPException(status_code=404, detail="Zone not found for this camera")
-        zone_name = zone.name
-    else:
-        zone = _zone_filter_from_zones(zones_for_camera)
-        if zone is None:
-            raise HTTPException(
-                status_code=400,
-                detail="No configured zone polygons found for this camera",
-            )
-        zone_name = "All Zones"
-
-    try:
-        start_dt = _parse_datetime(request.start)
-        end_dt = _parse_datetime(request.end)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid datetime format: {exc}") from exc
-
-    start_query_dt = _to_utc_naive(start_dt)
-    end_query_dt = _to_utc_naive(end_dt)
-    if end_query_dt < start_query_dt:
-        raise HTTPException(status_code=400, detail="end must be greater than or equal to start")
-
-    frames = await crud.get_frames_for_range(session, request.camera_id, start_query_dt, end_query_dt)
-    if not frames:
-        raise HTTPException(status_code=404, detail="No frames found for the specified time range")
-
-    service = get_facial_expression_service()
-    if not service.is_available():
-        raise HTTPException(status_code=503, detail=service.error_message())
-
-    result = await asyncio.to_thread(service.analyze_frames, frames, zone)
-    return {
-        "camera_id": request.camera_id,
-        "zone_id": request.zone_id,
-        "zone_name": zone_name,
-        "start_time": start_query_dt.isoformat(),
-        "end_time": end_query_dt.isoformat(),
-        "detector_available": True,
-        "processed_frames": int(result.get("processed_frames", 0)),
-        "analyzed_faces": int(result.get("analyzed_faces", 0)),
-        "dominant_emotion": result.get("dominant_emotion"),
-        "emotion_counts": result.get("emotion_counts", {}),
-        "emotion_percentages": result.get("emotion_percentages", {}),
-        "avg_age": result.get("avg_age"),
-        "gender_counts": result.get("gender_counts", {}),
-        "age_distribution": result.get("age_distribution", {}),
-        "series": result.get("series", []),
-    }
-
 
 
 async def list_analysis_jobs(session: AsyncSession, camera_id: int | None):

@@ -4,7 +4,7 @@ from fastapi import FastAPI
 
 from app.core.lifecycle import create_lifespan
 from app.db.session import ping_db
-from app.views import VERSIONED_ROUTERS, analyzer
+from app.views import VERSIONED_ROUTERS
 
 
 def create_app() -> FastAPI:
@@ -21,9 +21,6 @@ def create_app() -> FastAPI:
 
     for router in VERSIONED_ROUTERS:
         app.include_router(router, prefix="/api")
-
-    # Backward-compatible alias for analyzer routes consumed by the frontend.
-    app.include_router(analyzer.router, prefix="/api/v1")
 
     return app
 

@@ -22,7 +22,7 @@ const LINE_WIDTH = 5;
 const RAD_45 = Math.PI / 4;
 
 /* ── types ───────────────────────────────────────────────────────── */
-export type DrawMode = "polygon" | "entry_line" | "exit_line" | "rectangle";
+export type DrawMode = "polygon" | "entry_line" | "exit_line";
 export type Pt = [number, number];
 
 export type Shape = {
@@ -339,14 +339,6 @@ export const PolygonCanvas = forwardRef<PolygonCanvasHandle, PolygonCanvasProps>
 
       const pts = curPts.current;
       const closeRadius = CLOSE_RADIUS / Math.max(scaleRef.current, 1e-6);
-
-      if (drawModeRef.current === "rectangle") {
-        if (pts.length === 0) {
-          pts.push([x, y]);
-        }
-        return;
-      }
-
       if (pts.length > 2 && drawModeRef.current === "polygon" && ptDist([x, y], pts[0]) <= closeRadius) {
         closePath();
         return;
@@ -389,18 +381,6 @@ export const PolygonCanvas = forwardRef<PolygonCanvasHandle, PolygonCanvasProps>
       ctx.lineJoin = "bevel";
       ctx.strokeStyle = clr;
 
-      if (drawModeRef.current === "rectangle" && pts.length === 1) {
-        const [startX, startY] = pts[0];
-        ctx.beginPath();
-        ctx.rect(startX, startY, x - startX, y - startY);
-        ctx.stroke();
-        drawNode(ctx, startX, startY, clr);
-        drawNode(ctx, x, startY, clr);
-        drawNode(ctx, x, y, clr);
-        drawNode(ctx, startX, y, clr);
-        return;
-      }
-
       for (let i = 0; i < pts.length - 1; i++) {
         ctx.beginPath();
         ctx.moveTo(pts[i][0], pts[i][1]);
@@ -421,38 +401,10 @@ export const PolygonCanvas = forwardRef<PolygonCanvasHandle, PolygonCanvasProps>
       }
     }
 
-    function handleMouseUp(e: React.MouseEvent<HTMLCanvasElement>) {
+    function handleMouseUp() {
       if (editModeRef.current) {
         selPoly.current = -1;
         selPtIdx.current = -1;
-        return;
-      }
-
-      if (drawModeRef.current === "rectangle" && curPts.current.length === 1) {
-        let [x, y] = scaledCoords(e);
-        [x, y] = snapAngle(x, y);
-        const [startX, startY] = curPts.current[0];
-        
-        if (Math.abs(x - startX) > 5 && Math.abs(y - startY) > 5) {
-          const rectPts: Pt[] = [
-            [startX, startY],
-            [x, startY],
-            [x, y],
-            [startX, y],
-          ];
-          // We save it as "polygon" so standard analytics engine logic applies natively
-          masterPts.current.push({ mode: "polygon", points: rectPts });
-          masterClr.current.push(COLORS[colorIdx.current % COLORS.length]);
-          colorIdx.current++;
-          emitChange();
-        }
-        
-        curPts.current = [];
-        const off = offRef.current;
-        if (off) {
-          drawAll(off.getContext("2d")!);
-          blit();
-        }
       }
     }
 

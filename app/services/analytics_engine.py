@@ -16,7 +16,6 @@ from app.services.boxmot_utils import (
     ensure_bytetrack_outputs,
     resolve_tracker_config_path,
 )
-from app.services.yolo_threadsafe import build_locked_callable
 from app.services.yolo_person_classes import resolve_person_class_ids
 from app.services.zone_geometry import line_points_from_polygon, region_points_from_polygon
 
@@ -55,7 +54,6 @@ class AnalyticsEngine:
         self._model_available = False
         self._model_error: str | None = None
         self._yolo = None
-        self._predict = None
         self._cv2 = None
         self._np = None
         self._person_class_ids: list[int] = [0]
@@ -70,7 +68,6 @@ class AnalyticsEngine:
                 import boxmot  # type: ignore
 
                 self._yolo = YOLO(settings.yolo_model_path)
-                self._predict = build_locked_callable(self._yolo.predict)
                 self._create_tracker = create_tracker
                 self._tracker_config_path = resolve_tracker_config_path(boxmot, "bytetrack")
 
@@ -151,7 +148,6 @@ class AnalyticsEngine:
         if not (
             self._use_yolo
             and self._yolo is not None
-            and self._predict is not None
             and self._cv2 is not None
             and self._np is not None
             and self._create_tracker is not None
@@ -164,12 +160,9 @@ class AnalyticsEngine:
         if not zones:
             return ZoneTransitions(entries={}, exits={})
 
-        if not Path(path).is_file():
-            return _empty_zone_transitions(zones)
-
         frame = self._cv2.imread(path)
         if frame is None:
-            logger.debug("Failed to read frame %s", path)
+            logger.warning("Failed to read frame %s", path)
             return _empty_zone_transitions(zones)
 
         height, width = frame.shape[:2]
@@ -191,7 +184,7 @@ class AnalyticsEngine:
         if self._person_class_ids:
             predict_kwargs["classes"] = self._person_class_ids
 
-        results = self._predict(frame, **predict_kwargs)
+        results = self._yolo.predict(frame, **predict_kwargs)
         if not results or results[0].boxes is None:
             return self._np.empty((0, 6), dtype=self._np.float32)
 

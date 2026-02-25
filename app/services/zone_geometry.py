@@ -60,29 +60,17 @@ def region_points_from_polygon(
             continue
 
         # Treat values that are slightly out of [0, 1] as normalized coordinates.
-        is_normalized_01 = all(
+        is_normalized = all(
             -NORMALIZED_COORD_EPSILON <= x <= 1.0 + NORMALIZED_COORD_EPSILON
             and -NORMALIZED_COORD_EPSILON <= y <= 1.0 + NORMALIZED_COORD_EPSILON
             for x, y in parsed
         )
 
-        # If not 0-1, check if they are in 0-100 range (percentages)
-        is_normalized_100 = not is_normalized_01 and all(
-            -NORMALIZED_COORD_EPSILON * 100 <= x <= 100.0 + NORMALIZED_COORD_EPSILON * 100
-            and -NORMALIZED_COORD_EPSILON * 100 <= y <= 100.0 + NORMALIZED_COORD_EPSILON * 100
-            for x, y in parsed
-        )
-
         region: list[tuple[int, int]] = []
         for value_x, value_y in parsed:
-            if is_normalized_01:
+            if is_normalized:
                 nx = min(1.0, max(0.0, value_x))
                 ny = min(1.0, max(0.0, value_y))
-                px = int(round(nx * (width - 1)))
-                py = int(round(ny * (height - 1)))
-            elif is_normalized_100:
-                nx = min(1.0, max(0.0, value_x / 100.0))
-                ny = min(1.0, max(0.0, value_y / 100.0))
                 px = int(round(nx * (width - 1)))
                 py = int(round(ny * (height - 1)))
             else:
@@ -91,7 +79,6 @@ def region_points_from_polygon(
             px = max(0, min(width - 1, px))
             py = max(0, min(height - 1, py))
             region.append((px, py))
-
 
         # Preserve order but remove exact duplicates.
         deduped: list[tuple[int, int]] = []
