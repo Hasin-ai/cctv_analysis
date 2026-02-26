@@ -21,6 +21,8 @@ class QueueJobResponse(BaseModel):
     processed_frames: int
     max_queue_count: int
     avg_queue_count: float
+    avg_wait_time_sec: float | None = None
+    avg_throughput_exits_per_sec: float | None = None
     error: str | None
     created_at: str
 
@@ -28,6 +30,8 @@ class QueueJobResponse(BaseModel):
 class QueueFrameResultResponse(BaseModel):
     timestamp: str
     queue_count: int
+    wait_time_sec: float | None = None
+    throughput_exits_per_sec: float | None = None
 
 
 class QueueResultsResponse(BaseModel):
@@ -38,5 +42,7 @@ class QueueResultsResponse(BaseModel):
     status: str
     max_queue_count: int
     avg_queue_count: float
+    avg_wait_time_sec: float | None = None
+    avg_throughput_exits_per_sec: float | None = None
     frame_results: list[QueueFrameResultResponse]
 

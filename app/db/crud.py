@@ -125,8 +125,8 @@ async def update_stream_heartbeat(session: AsyncSession, stream: Stream, timesta
     await session.commit()
 
 
-async def create_zone(session: AsyncSession, camera_id: int, name: str, polygon: dict) -> Zone:
-    zone = Zone(camera_id=camera_id, name=name, polygon=polygon)
+async def create_zone(session: AsyncSession, camera_id: int, name: str, polygon: dict, capacity: int | None = None, expected_wait_time_sec: int | None = None) -> Zone:
+    zone = Zone(camera_id=camera_id, name=name, polygon=polygon, capacity=capacity, expected_wait_time_sec=expected_wait_time_sec)
     session.add(zone)
     await session.commit()
     await session.refresh(zone)
@@ -900,6 +900,8 @@ async def update_queue_analysis_job(
     processed_frames: int | None = None,
     max_queue_count: int | None = None,
     avg_queue_count: float | None = None,
+    avg_wait_time_sec: float | None = None,
+    avg_throughput_exits_per_sec: float | None = None,
     error: str | None = None,
 ) -> QueueAnalysisJob:
     if status is not None:
@@ -912,6 +914,10 @@ async def update_queue_analysis_job(
         job.max_queue_count = max_queue_count
     if avg_queue_count is not None:
         job.avg_queue_count = avg_queue_count
+    if avg_wait_time_sec is not None:
+        job.avg_wait_time_sec = avg_wait_time_sec
+    if avg_throughput_exits_per_sec is not None:
+        job.avg_throughput_exits_per_sec = avg_throughput_exits_per_sec
     if error is not None:
         job.error = error
     
@@ -927,12 +933,16 @@ async def create_queue_frame_result(
     frame_id: int,
     timestamp: datetime,
     queue_count: int,
+    wait_time_sec: float | None = None,
+    throughput_exits_per_sec: float | None = None,
 ) -> QueueFrameResult:
     result = QueueFrameResult(
         job_id=job_id,
         frame_id=frame_id,
         timestamp=timestamp,
         queue_count=queue_count,
+        wait_time_sec=wait_time_sec,
+        throughput_exits_per_sec=throughput_exits_per_sec,
     )
     session.add(result)
     await session.commit()

@@ -22,7 +22,9 @@ def get_queue_service() -> QueueManagementService:
 
 def _parse_datetime(value: str) -> datetime:
     cleaned = value.replace("Z", "+00:00")
-    return datetime.fromisoformat(cleaned)
+    dt = datetime.fromisoformat(cleaned)
+    # Strip tzinfo to create a naive datetime (assuming UTC input) for SQLite compatibility
+    return dt.replace(tzinfo=None)
 
 
 async def get_queue_status():
@@ -168,10 +170,14 @@ async def get_queue_results(session: AsyncSession, job_id: int):
         "status": job.status.value,
         "max_queue_count": job.max_queue_count,
         "avg_queue_count": job.avg_queue_count,
+        "avg_wait_time_sec": job.avg_wait_time_sec,
+        "avg_throughput_exits_per_sec": job.avg_throughput_exits_per_sec,
         "frame_results": [
             {
                 "timestamp": result.timestamp.isoformat(),
                 "queue_count": result.queue_count,
+                "wait_time_sec": result.wait_time_sec,
+                "throughput_exits_per_sec": result.throughput_exits_per_sec,
             }
             for result in frame_results
         ],
@@ -190,6 +196,8 @@ def _job_to_response(job) -> QueueJobResponse:
         processed_frames=job.processed_frames,
         max_queue_count=job.max_queue_count,
         avg_queue_count=job.avg_queue_count,
+        avg_wait_time_sec=job.avg_wait_time_sec,
+        avg_throughput_exits_per_sec=job.avg_throughput_exits_per_sec,
         error=job.error,
         created_at=job.created_at.isoformat(),
     )

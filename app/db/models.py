@@ -69,7 +69,9 @@ class Zone(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     camera_id: Mapped[int] = mapped_column(ForeignKey("cameras.id", ondelete="CASCADE"), index=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
-    polygon: Mapped[dict] = mapped_column(JSON)
+    polygon: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    capacity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    expected_wait_time_sec: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
 
     camera: Mapped[Camera] = relationship(back_populates="zones")
@@ -237,6 +239,8 @@ class QueueAnalysisJob(Base):
     processed_frames: Mapped[int] = mapped_column(Integer, default=0)
     max_queue_count: Mapped[int] = mapped_column(Integer, default=0)
     avg_queue_count: Mapped[float] = mapped_column(Float, default=0.0)
+    avg_wait_time_sec: Mapped[float | None] = mapped_column(Float, nullable=True)
+    avg_throughput_exits_per_sec: Mapped[float | None] = mapped_column(Float, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
 
@@ -253,5 +257,7 @@ class QueueFrameResult(Base):
     frame_id: Mapped[int] = mapped_column(ForeignKey("frames.id", ondelete="CASCADE"), index=True)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     queue_count: Mapped[int] = mapped_column(Integer)
+    wait_time_sec: Mapped[float | None] = mapped_column(Float, nullable=True)
+    throughput_exits_per_sec: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     job: Mapped[QueueAnalysisJob] = relationship(back_populates="frame_results")

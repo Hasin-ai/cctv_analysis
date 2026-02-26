@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from collections import deque
+import time
 
 from app.core.config import settings
 from app.db import crud
@@ -16,6 +18,73 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
+
+class WaitTimeEstimator:
+    """
+    Throughput-based wait time estimator:
+      wait_time ≈ queue_len / throughput
+    where throughput = exits_per_second over a rolling window.
+    """
+
+    def __init__(self, window_seconds: float = 30.0, min_exits: int = 1):
+        self.window_seconds = window_seconds
+        self.min_exits = min_exits
+
+        self._inside_ids = set()
+        self._exit_timestamps = deque()  # timestamps when an ID exits ROI
+
+        # Optional: dwell-time tracking
+        self._enter_time = {}  # track_id -> enter timestamp
+        self._dwell_samples = deque(maxlen=200)  # recent dwell times
+
+    def update(self, track_ids_in_roi, now=None):
+        now = now or time.time()
+        track_ids_in_roi = set(track_ids_in_roi)
+
+        # IDs that just entered / exited
+        entered = track_ids_in_roi - self._inside_ids
+        exited = self._inside_ids - track_ids_in_roi
+
+        # Record enter times (for optional dwell stats)
+        for tid in entered:
+            self._enter_time[tid] = now
+
+        # Record exits (for throughput) + dwell samples
+        for tid in exited:
+            self._exit_timestamps.append(now)
+            if tid in self._enter_time:
+                self._dwell_samples.append(now - self._enter_time.pop(tid, now))
+
+        self._inside_ids = track_ids_in_roi
+
+        # Drop old exits outside the rolling window
+        cutoff = now - self.window_seconds
+        while self._exit_timestamps and self._exit_timestamps[0] < cutoff:
+            self._exit_timestamps.popleft()
+
+        queue_len = len(self._inside_ids)
+
+        # Throughput (exits/sec)
+        exits = len(self._exit_timestamps)
+        throughput = exits / self.window_seconds if self.window_seconds > 0 else 0.0
+
+        wait_time_sec = None
+        if exits >= self.min_exits and throughput > 1e-6:
+            wait_time_sec = queue_len / throughput  # seconds
+
+        # Optional dwell-based estimate (median of samples)
+        dwell_median = None
+        if len(self._dwell_samples) >= 5:
+            s = sorted(self._dwell_samples)
+            dwell_median = s[len(s)//2]
+
+        return {
+            "queue_len": queue_len,
+            "exits_in_window": exits,
+            "throughput_exits_per_sec": throughput,
+            "wait_time_sec": wait_time_sec,
+            "dwell_median_sec": dwell_median,
+        }
 
 
 class QueueManagementService:
@@ -96,6 +165,8 @@ class QueueManagementService:
                 processed_frames=result["processed_frames"],
                 max_queue_count=result["max_queue_count"],
                 avg_queue_count=result["avg_queue_count"],
+                avg_wait_time_sec=result.get("avg_wait_time_sec"),
+                avg_throughput_exits_per_sec=result.get("avg_throughput_exits_per_sec"),
             )
             return result
         except Exception as exc:  # noqa: BLE001
@@ -118,17 +189,34 @@ class QueueManagementService:
     ) -> dict:
         """Run per-frame queue occupancy counting over each frame."""
         width, height = self._detect_frame_size(frames)
-        region_points = region_points_from_polygon(
+        polygons = region_points_from_polygon(
             zone_polygon,
             width,
             height,
             use_default_on_invalid=False,
         )
+        
+        region_points = []
+        if polygons:
+            # We want a flat list of (x,y) tuples for OpenCV.
+            # Depending on mapping it might be [[(x,y), ...]] or just [(x,y), ...]
+            first_poly = polygons[0]
+            if first_poly and isinstance(first_poly, list) and isinstance(first_poly[0], tuple):
+                region_points = first_poly
+            elif first_poly and isinstance(first_poly, tuple):
+                region_points = polygons
+            else:
+                 # Flatten safely if highly nested
+                 for block in polygons:
+                     if isinstance(block, list):
+                         region_points.extend(block)
+
         if len(region_points) < 3:
             raise RuntimeError("Zone polygon is invalid for queue analysis")
 
         frame_counts: list[dict[str, Any]] = []
         processed_frames = 0
+        estimator = WaitTimeEstimator(window_seconds=30.0, min_exits=1)
 
         for frame in frames:
             if not Path(frame.path).exists():
@@ -138,7 +226,11 @@ class QueueManagementService:
             if image is None:
                 continue
 
-            queue_count = self._count_people_in_region(image, region_points)
+            ids_in_region = self._extract_track_ids_in_region(image, region_points)
+            metrics = estimator.update(ids_in_region, now=frame.timestamp.timestamp())
+            queue_count = metrics["queue_len"]
+            wait_time = metrics["wait_time_sec"]
+            throughput = metrics["throughput_exits_per_sec"]
 
             await crud.create_queue_frame_result(
                 session=session,
@@ -146,24 +238,38 @@ class QueueManagementService:
                 frame_id=frame.id,
                 timestamp=frame.timestamp,
                 queue_count=queue_count,
+                wait_time_sec=wait_time,
+                throughput_exits_per_sec=throughput,
             )
 
-            frame_counts.append({"timestamp": frame.timestamp.isoformat(), "queue_count": queue_count})
+            frame_counts.append({
+                "timestamp": frame.timestamp.isoformat(), 
+                "queue_count": queue_count,
+                "wait_time_sec": wait_time,
+                "throughput": throughput
+            })
             processed_frames += 1
 
         counts = [entry["queue_count"] for entry in frame_counts]
+        waits = [entry["wait_time_sec"] for entry in frame_counts if entry["wait_time_sec"] is not None]
+        throughputs = [entry["throughput"] for entry in frame_counts if entry["throughput"] is not None]
+
         max_count = max(counts) if counts else 0
         avg_count = round(sum(counts) / len(counts), 2) if counts else 0.0
+        avg_wait = round(sum(waits) / len(waits), 2) if waits else None
+        avg_throughput = round(sum(throughputs) / len(throughputs), 3) if throughputs else None
 
         return {
             "zone_id": zone_id,
             "max_queue_count": max_count,
             "avg_queue_count": avg_count,
+            "avg_wait_time_sec": avg_wait,
+            "avg_throughput_exits_per_sec": avg_throughput,
             "processed_frames": processed_frames,
             "frame_counts": frame_counts,
         }
 
-    def _count_people_in_region(self, image: Any, region_points: list[tuple[int, int]]) -> int:
+    def _extract_track_ids_in_region(self, image: Any, region_points: list[tuple[int, int]]) -> list[int]:
         try:
             predict_kwargs: dict[str, Any] = {
                 "conf": settings.yolo_confidence,
@@ -172,36 +278,47 @@ class QueueManagementService:
             }
             if self._person_class_ids:
                 predict_kwargs["classes"] = self._person_class_ids
-            results = self._yolo.predict(image, **predict_kwargs)
+                
+            # Use ByteTrack for object IDs
+            predict_kwargs["tracker"] = "bytetrack.yaml"
+            results = self._yolo.track(image, persist=True, **predict_kwargs)
             boxes = results[0].boxes if results and results[0].boxes is not None else None
-            if boxes is None:
-                return 0
+            
+            if boxes is None or boxes.id is None:
+                return []
 
             xyxy = boxes.xyxy.cpu().numpy().astype(self._np.float32)
+            track_ids = boxes.id.cpu().numpy().astype(self._np.int32)
+            
             if len(xyxy) == 0:
-                return 0
+                return []
 
             cls_data = getattr(boxes, "cls", None)
             if self._person_class_ids and cls_data is not None:
                 cls = cls_data.cpu().numpy().astype(self._np.int32)
                 mask = self._np.isin(cls, self._person_class_ids)
                 xyxy = xyxy[mask]
+                track_ids = track_ids[mask]
 
-            count = 0
-            for row in xyxy:
+            in_region_ids = []
+            for i, row in enumerate(xyxy):
                 if len(row) < 4:
                     continue
                 x1, y1, x2, y2 = float(row[0]), float(row[1]), float(row[2]), float(row[3])
                 if x2 <= x1 or y2 <= y1:
                     continue
+                
+                # Bottom-center point for region crossing
                 foot_x = (x1 + x2) / 2.0
                 foot_y = y2
+                
                 if self._point_in_polygon(foot_x, foot_y, region_points):
-                    count += 1
-            return int(count)
+                    in_region_ids.append(int(track_ids[i]))
+                    
+            return in_region_ids
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Queue analysis inference failed: %s", exc)
-            return 0
+            logger.warning("Queue analysis tracking failed: %s", exc)
+            return []
 
     def _point_in_polygon(self, x: float, y: float, polygon: list[tuple[int, int]]) -> bool:
         if len(polygon) < 3:

@@ -17,6 +17,8 @@ async def create_zone(payload: ZoneCreate, session: AsyncSession = Depends(get_s
         payload.camera_id,
         payload.name,
         payload.polygon,
+        payload.capacity,
+        payload.expected_wait_time_sec,
     )
 
 

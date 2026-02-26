@@ -71,6 +71,8 @@ class ZoneCreate(BaseModel):
     camera_id: int
     name: str = Field(..., min_length=1)
     polygon: dict
+    capacity: int | None = None
+    expected_wait_time_sec: int | None = None
 
 
 class ZoneRead(BaseModel):
@@ -78,6 +80,8 @@ class ZoneRead(BaseModel):
     camera_id: int
     name: str
     polygon: dict
+    capacity: int | None = None
+    expected_wait_time_sec: int | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}

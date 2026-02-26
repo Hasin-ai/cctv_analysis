@@ -18,11 +18,11 @@ def _parse_datetime(value: str | None) -> datetime | None:
     return datetime.fromisoformat(cleaned)
 
 
-async def create_zone(session: AsyncSession, camera_id: int, name: str, polygon: dict):
+async def create_zone(session: AsyncSession, camera_id: int, name: str, polygon: dict, capacity: int | None = None, expected_wait_time_sec: int | None = None):
     camera = await crud.get_camera(session, camera_id)
     if not camera:
         raise HTTPException(status_code=404, detail="Camera not found")
-    return await crud.create_zone(session, camera_id, name, polygon)
+    return await crud.create_zone(session, camera_id, name, polygon, capacity=capacity, expected_wait_time_sec=expected_wait_time_sec)
 
 
 async def list_zones(session: AsyncSession, camera_id: int | None):

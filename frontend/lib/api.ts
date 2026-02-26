@@ -85,6 +85,8 @@ export type Zone = {
     };
     [key: string]: unknown;
   };
+  capacity: number | null;
+  expected_wait_time_sec: number | null;
   created_at: string;
 };
 
@@ -223,6 +225,8 @@ export type QueueZone = {
     points?: Array<{ x: number; y: number }>;
     [key: string]: unknown;
   };
+  capacity: number | null;
+  expected_wait_time_sec: number | null;
   created_at: string;
 };
 
@@ -237,6 +241,8 @@ export type QueueJob = {
   processed_frames: number;
   max_queue_count: number;
   avg_queue_count: number;
+  avg_wait_time_sec: number | null;
+  avg_throughput_exits_per_sec: number | null;
   error: string | null;
   created_at: string;
 };
@@ -249,7 +255,9 @@ export type QueueResult = {
   status: string;
   max_queue_count: number;
   avg_queue_count: number;
-  frame_results: Array<{ timestamp: string; queue_count: number }>;
+  avg_wait_time_sec: number | null;
+  avg_throughput_exits_per_sec: number | null;
+  frame_results: Array<{ timestamp: string; queue_count: number; wait_time_sec: number | null; throughput_exits_per_sec: number | null }>;
 };
 
 export type ReconstructionJob = {
@@ -419,10 +427,10 @@ export async function listZones(cameraId?: number) {
   return request<Zone[]>(withQuery("/api/analytics/zones", { camera_id: cameraId }));
 }
 
-export async function createZone(cameraId: number, name: string, polygon: Record<string, unknown>) {
+export async function createZone(cameraId: number, name: string, polygon: Record<string, unknown>, capacity: number | null = null, expectedWaitTimeSec: number | null = null) {
   return request<Zone>("/api/analytics/zones", {
     method: "POST",
-    body: JSON.stringify({ camera_id: cameraId, name, polygon }),
+    body: JSON.stringify({ camera_id: cameraId, name, polygon, capacity, expected_wait_time_sec: expectedWaitTimeSec }),
   });
 }
 

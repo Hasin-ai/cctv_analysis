@@ -39,12 +39,19 @@ async def _create_all_v5(conn) -> None:
     await _ensure_column(conn, "footfall_events", "event_type", "VARCHAR(20) NOT NULL DEFAULT 'entry'")
 
 
+async def _create_all_v6(conn) -> None:
+    await conn.run_sync(Base.metadata.create_all)
+    await _ensure_column(conn, "zones", "capacity", "INTEGER")
+    await _ensure_column(conn, "zones", "expected_wait_time_sec", "INTEGER")
+
+
 MIGRATIONS: list[Callable] = [
     _create_all,
     _create_all,
     _create_all_v3,
     _create_all_v4,
     _create_all_v5,
+    _create_all_v6,
 ]
 
 

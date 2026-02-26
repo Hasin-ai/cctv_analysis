@@ -17,6 +17,7 @@ import {
   startStream,
   startAnalyticsRun,
   stopStream,
+  runQueueAnalysis,
 } from "@/lib/api";
 
 const ZONE_COLORS = [
@@ -229,6 +230,8 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
   const [selectedZoneId, setSelectedZoneId] = useState<number | null>(null);
   const [isCreatingZone, setIsCreatingZone] = useState(false);
   const [zoneName, setZoneName] = useState("Zone A");
+  const [zoneCapacity, setZoneCapacity] = useState("");
+  const [zoneExpectedWaitTime, setZoneExpectedWaitTime] = useState("");
   const [zoneColor, setZoneColor] = useState(ZONE_COLORS[0]);
   const [imageSize, setImageSize] = useState<ImageSize | null>(null);
   const [canvasPolygons, setCanvasPolygons] = useState<Shape[]>([]);
@@ -695,13 +698,15 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
           }
         : undefined;
 
-      const createdZone = await createZone(selectedCameraId, zoneName.trim(), {
-        color: zoneColor,
-        points: payloadPolygons[0] || [], // Legacy fallback
-        polygons: payloadPolygons, // New Array of Arrays format
-        entry_line: entryLinePayload,
-        exit_line: exitLinePayload,
-      });
+    const parsedWaitTime = zoneExpectedWaitTime.trim() ? parseInt(zoneExpectedWaitTime.trim(), 10) : null;
+    const parsedCapacity = zoneCapacity.trim() ? parseInt(zoneCapacity.trim(), 10) : null;
+    const createdZone = await createZone(selectedCameraId, zoneName.trim(), {
+      color: zoneColor,
+      points: payloadPolygons[0] || [], // Legacy fallback
+      polygons: payloadPolygons, // New Array of Arrays format
+      entry_line: entryLinePayload,
+      exit_line: exitLinePayload,
+    }, parsedCapacity, parsedWaitTime);
 
       await refreshZones(selectedCameraId);
       setSelectedZoneId(createdZone.id);
@@ -710,6 +715,8 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
         `Saved ${zoneName.trim()} with ${payloadPolygons.length} polygons${entryLinePayload ? " and entry line" : ""}${exitLinePayload ? " and exit line" : ""}`,
       );
       setZoneName((previous) => (previous.toLowerCase().endsWith("a") ? "Zone B" : "Zone A"));
+      setZoneCapacity("");
+      setZoneExpectedWaitTime("");
 
       const idx = ZONE_COLORS.indexOf(zoneColor);
       setZoneColor(ZONE_COLORS[(idx + 1) % ZONE_COLORS.length]);
@@ -844,15 +851,60 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
           continue;
         }
 
+        if (mode === "queue") {
+          try {
+            // Wait up to 10 seconds for the camera stream to ingest its first frame into SQLite
+            // to prevent the backend queue analyzer from failing with "No frames found"
+            let liveCamSource = null;
+            for (let i = 0; i < 10; i++) {
+              const monitoring = await getRealtimeMonitoring();
+              const cam = monitoring.cameras.find((c) => c.camera_id === selectedCameraId);
+              if (cam?.has_live_frame) {
+                liveCamSource = cam;
+                break;
+              }
+              await new Promise((resolve) => setTimeout(resolve, 1000));
+            }
+
+            if (!liveCamSource) {
+                throw new Error("Timeout waiting for camera to capture its first frame. Please ensure the RTSP source is active.");
+            }
+
+            const window = buildAnalysisWindow(liveCamSource.frame_timestamp);
+            const response = await runQueueAnalysis({
+              camera_id: selectedCameraId,
+              zone_id: selectedZone.id,
+              start: window.start,
+              end: window.end,
+            });
+            newTasks.push({
+              id: taskId,
+              mode,
+              zoneName: selectedZone.name,
+              status: "pending",
+              message: `Queue Analytics active (job #${response.job_id})`,
+              createdAt: new Date().toISOString(),
+            });
+          } catch (err) {
+            newTasks.push({
+              id: taskId,
+              mode,
+              zoneName: selectedZone.name,
+              status: "failed",
+              message: err instanceof Error ? err.message : "Failed to start Queue Analytics",
+              createdAt: new Date().toISOString(),
+            });
+          }
+          continue;
+        }
+
         newTasks.push({
           id: taskId,
           mode,
           zoneName: selectedZone.name,
           status: "completed",
           message:
-            mode === "queue"
-              ? "Queue Management is temporarily mapped to realtime person analytics."
-              : mode === "entry_exit_count"
+            mode === "entry_exit_count"
               ? "Entry/Exit tracking is active in background."
               : "Realtime person analytics is active in background.",
           createdAt: new Date().toISOString(),
@@ -958,6 +1010,30 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
             </div>
 
             <div>
+              <label className="mb-1 block text-xs font-semibold text-muted-foreground">Person Capacity</label>
+              <input
+                type="number"
+                min="1"
+                value={zoneCapacity}
+                onChange={(event) => setZoneCapacity(event.target.value)}
+                className="h-10 w-full rounded-lg border border-input bg-white px-3 text-sm text-foreground"
+                placeholder="Optional capacity limit"
+              />
+            </div>
+
+            <div>
+              <label className="mb-1 block text-xs font-semibold text-muted-foreground">Wait Time Threshold (sec)</label>
+              <input
+                type="number"
+                min="1"
+                value={zoneExpectedWaitTime}
+                onChange={(event) => setZoneExpectedWaitTime(event.target.value)}
+                className="h-10 w-full rounded-lg border border-input bg-white px-3 text-sm text-foreground"
+                placeholder="Expected wait time target"
+              />
+            </div>
+
+            <div>
               <label className="mb-1 block text-xs font-semibold text-muted-foreground">Zone Color</label>
               <div className="flex flex-wrap gap-2">
                 {ZONE_COLORS.map((color) => (
@@ -1018,6 +1094,8 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
                   setIsCreatingZone(true);
                   setSelectedZoneId(null);
                   setZoneName((previous) => (previous.toLowerCase().endsWith("a") ? "Zone B" : "Zone A"));
+                  setZoneCapacity("");
+                  setZoneExpectedWaitTime("");
                   setZoneColor(ZONE_COLORS[0]);
                   canvasRef.current?.loadPolygons([]);
                   setPolygons([]);
@@ -1284,7 +1362,7 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
             ) : null}
 
             <div className="rounded-lg border border-border/70 bg-white/80 px-3 py-2 text-xs text-muted-foreground">
-              <p>Queue Management is currently mapped to Person Count backend.</p>
+              <p>Queue Management utilizes the dedicated Waiting Time backend.</p>
               <p>Latest frame: {formatTimestamp(selectedSource?.realtime?.frame_timestamp)}</p>
             </div>
 

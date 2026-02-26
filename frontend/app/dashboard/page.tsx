@@ -31,6 +31,7 @@ import {
 } from "@/components/v2/ui";
 import { PersonReidAnalyticsPanel } from "@/components/v2/person-reid-analytics-panel";
 import { ZoneQuickEditor } from "@/components/v2/zone-quick-editor";
+import { QueueAnalyticsPanel } from "@/components/v2/queue-analytics-panel";
 
 type TimelinePoint = {
   ts: number;
@@ -39,8 +40,12 @@ type TimelinePoint = {
 
 function ModeAnalyticsPanel({
   timeline,
+  zones = [],
+  liveZones = [],
 }: {
   timeline: TimelinePoint[];
+  zones?: Zone[];
+  liveZones?: RealtimeZoneCount[];
 }) {
   const current = timeline[timeline.length - 1] ?? {
     ts: Date.now(),
@@ -62,6 +67,39 @@ function ModeAnalyticsPanel({
       <div className="rounded-xl border border-border/70 bg-white/80 p-3">
         <MiniLineChart values={timeline.map((point) => point.person)} />
       </div>
+      
+      {zones.length > 0 && (
+        <div className="overflow-x-auto rounded-xl border border-border/70 bg-white/80 mt-3">
+          <table className="min-w-full text-left text-xs">
+            <thead className="bg-muted/40 text-muted-foreground">
+              <tr>
+                <th className="px-3 py-2 font-semibold uppercase tracking-[0.1em]">Zone</th>
+                <th className="px-3 py-2 font-semibold uppercase tracking-[0.1em]">Live Count</th>
+                <th className="px-3 py-2 font-semibold uppercase tracking-[0.1em]">Capacity / Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {zones.map((zone) => {
+                const liveCount = liveZones.find((lz) => lz.zone_id === zone.id)?.person_count ?? 0;
+                const capacity = zone.capacity;
+                const statusStr = capacity 
+                  ? (liveCount > capacity ? `+${liveCount - capacity} Extra Persons` : `${liveCount} / ${capacity} Capacity`) 
+                  : "-";
+                  
+                return (
+                  <tr key={zone.id} className="border-t border-border/50">
+                    <td className="px-3 py-2 text-foreground">{zone.name}</td>
+                    <td className="px-3 py-2 tabular-nums text-sky-700">{liveCount}</td>
+                    <td className="px-3 py-2 tabular-nums font-semibold">
+                      <span className={capacity && liveCount > capacity ? "text-rose-600" : "text-emerald-600"}>{statusStr}</span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
@@ -758,7 +796,7 @@ export default function DashboardPage() {
 
           <div className="grid gap-3">
             <PanelCard title="Zone Analytics" subtitle="Person Count">
-              <ModeAnalyticsPanel timeline={selectedTimeline} />
+              <ModeAnalyticsPanel timeline={selectedTimeline} zones={zonesByCamera[selected.camera.id] ?? []} liveZones={selected?.realtime?.zones ?? []} />
             </PanelCard>
 
             <PanelCard
@@ -773,7 +811,7 @@ export default function DashboardPage() {
             </PanelCard>
             
             <PanelCard title="Queue Management" subtitle="Waiting times & line length">
-              <p className="text-sm text-muted-foreground">Queue analytics not available yet for this camera.</p>
+              <QueueAnalyticsPanel cameraId={selected.camera.id} zones={zonesByCamera[selected.camera.id] ?? []} />
             </PanelCard>
           </div>
         </div>
