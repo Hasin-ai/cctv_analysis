@@ -42,7 +42,8 @@ class QueueResultsResponse(BaseModel):
     status: str
     max_queue_count: int
     avg_queue_count: float
+    avg_line_length: float | None = None
+    current_line_length: int | None = None
     avg_wait_time_sec: float | None = None
     avg_throughput_exits_per_sec: float | None = None
     frame_results: list[QueueFrameResultResponse]
-

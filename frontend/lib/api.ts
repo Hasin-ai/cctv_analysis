@@ -255,8 +255,12 @@ export type QueueResult = {
   status: string;
   max_queue_count: number;
   avg_queue_count: number;
+  avg_line_length?: number | null;
+  current_line_length?: number | null;
   avg_wait_time_sec: number | null;
   avg_throughput_exits_per_sec: number | null;
+  avg_dwell_sec?: number | null;
+  number_over_capacity?: number | null;
   frame_results: Array<{ timestamp: string; queue_count: number; wait_time_sec: number | null; throughput_exits_per_sec: number | null }>;
 };
 

@@ -811,7 +811,11 @@ export default function DashboardPage() {
             </PanelCard>
             
             <PanelCard title="Queue Management" subtitle="Waiting times & line length">
-              <QueueAnalyticsPanel cameraId={selected.camera.id} zones={zonesByCamera[selected.camera.id] ?? []} />
+              <QueueAnalyticsPanel
+                cameraId={selected.camera.id}
+                zones={zonesByCamera[selected.camera.id] ?? []}
+                selectedZoneId={selectedZoneId}
+              />
             </PanelCard>
           </div>
         </div>

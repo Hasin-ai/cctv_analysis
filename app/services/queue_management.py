@@ -21,19 +21,22 @@ logger = logging.getLogger(__name__)
 
 class WaitTimeEstimator:
     """
-    Throughput-based wait time estimator:
-      wait_time ≈ queue_len / throughput
-    where throughput = exits_per_second over a rolling window.
+    Hybrid wait time estimator combining:
+      1. Capacity-overflow model (from main_heatmap_multi.py):
+           wait = avg_dwell_time × (number_over_capacity / capacity)
+      2. Throughput-based Little's Law fallback:
+           wait = queue_len / throughput
     """
 
-    def __init__(self, window_seconds: float = 30.0, min_exits: int = 1):
+    def __init__(self, window_seconds: float = 30.0, min_exits: int = 1, zone_capacity: int | None = None):
         self.window_seconds = window_seconds
         self.min_exits = min_exits
+        self.zone_capacity = zone_capacity  # from Zone.capacity DB field
 
         self._inside_ids = set()
         self._exit_timestamps = deque()  # timestamps when an ID exits ROI
 
-        # Optional: dwell-time tracking
+        # Dwell-time tracking
         self._enter_time = {}  # track_id -> enter timestamp
         self._dwell_samples = deque(maxlen=200)  # recent dwell times
 
@@ -45,11 +48,11 @@ class WaitTimeEstimator:
         entered = track_ids_in_roi - self._inside_ids
         exited = self._inside_ids - track_ids_in_roi
 
-        # Record enter times (for optional dwell stats)
+        # Record enter times
         for tid in entered:
             self._enter_time[tid] = now
 
-        # Record exits (for throughput) + dwell samples
+        # Record exits + dwell samples
         for tid in exited:
             self._exit_timestamps.append(now)
             if tid in self._enter_time:
@@ -68,15 +71,52 @@ class WaitTimeEstimator:
         exits = len(self._exit_timestamps)
         throughput = exits / self.window_seconds if self.window_seconds > 0 else 0.0
 
-        wait_time_sec = None
-        if exits >= self.min_exits and throughput > 1e-6:
-            wait_time_sec = queue_len / throughput  # seconds
-
-        # Optional dwell-based estimate (median of samples)
+        # Average dwell time (mean of recent samples)
+        avg_dwell = None
         dwell_median = None
-        if len(self._dwell_samples) >= 5:
+        if len(self._dwell_samples) >= 1:
             s = sorted(self._dwell_samples)
-            dwell_median = s[len(s)//2]
+            dwell_median = s[len(s) // 2]
+            avg_dwell = sum(self._dwell_samples) / len(self._dwell_samples)
+
+        # --- Capacity-overflow model (from main_heatmap_multi.py) ---
+        # queue_wait_time = avg_person_time * (number_waiting / MAX_CAPACITY)
+        capacity_wait = None
+        number_over_capacity = 0
+        if self.zone_capacity is not None and self.zone_capacity > 0:
+            number_over_capacity = max(0, queue_len - self.zone_capacity)
+            if number_over_capacity > 0 and avg_dwell is not None:
+                capacity_wait = avg_dwell * (number_over_capacity / self.zone_capacity)
+            elif number_over_capacity == 0:
+                capacity_wait = None
+
+        # --- Throughput-based fallback (Little's Law) ---
+        throughput_wait = None
+        if exits >= self.min_exits and throughput > 1e-6:
+            throughput_wait = queue_len / throughput
+
+        # --- Final wait time: prefer capacity model, fallback to throughput ---
+        wait_time_sec = None
+        if queue_len == 0:
+            wait_time_sec = 0.0
+        elif capacity_wait is not None:
+            # Capacity model is primary when zone has capacity configured
+            if throughput_wait is not None:
+                wait_time_sec = (capacity_wait * 0.7) + (throughput_wait * 0.3)
+            else:
+                wait_time_sec = capacity_wait
+        elif throughput_wait is not None:
+            if dwell_median is not None:
+                wait_time_sec = (throughput_wait * 0.6) + (dwell_median * 0.4)
+            else:
+                wait_time_sec = throughput_wait
+        elif dwell_median is not None:
+            wait_time_sec = dwell_median
+        else:
+            # Fallback: use oldest person's current dwell time
+            if self._enter_time:
+                oldest_tid = min(self._enter_time, key=self._enter_time.get)
+                wait_time_sec = now - self._enter_time[oldest_tid]
 
         return {
             "queue_len": queue_len,
@@ -84,6 +124,8 @@ class WaitTimeEstimator:
             "throughput_exits_per_sec": throughput,
             "wait_time_sec": wait_time_sec,
             "dwell_median_sec": dwell_median,
+            "avg_dwell_sec": avg_dwell,
+            "number_over_capacity": number_over_capacity,
         }
 
 
@@ -133,6 +175,7 @@ class QueueManagementService:
         zone_id: int,
         zone_polygon: Any,
         frames: list,
+        zone_capacity: int | None = None,
     ) -> dict:
         """Run queue analysis and persist per-frame queue counts."""
         job = await crud.get_queue_analysis_job(session, job_id)
@@ -157,7 +200,7 @@ class QueueManagementService:
             return {"error": error}
 
         try:
-            result = await self._queue_analysis(session, job_id, zone_id, zone_polygon, frames)
+            result = await self._queue_analysis(session, job_id, zone_id, zone_polygon, frames, zone_capacity=zone_capacity)
             await crud.update_queue_analysis_job(
                 session,
                 job,
@@ -186,6 +229,7 @@ class QueueManagementService:
         zone_id: int,
         zone_polygon: Any,
         frames: list,
+        zone_capacity: int | None = None,
     ) -> dict:
         """Run per-frame queue occupancy counting over each frame."""
         width, height = self._detect_frame_size(frames)
@@ -216,7 +260,7 @@ class QueueManagementService:
 
         frame_counts: list[dict[str, Any]] = []
         processed_frames = 0
-        estimator = WaitTimeEstimator(window_seconds=30.0, min_exits=1)
+        estimator = WaitTimeEstimator(window_seconds=30.0, min_exits=1, zone_capacity=zone_capacity)
 
         for frame in frames:
             if not Path(frame.path).exists():
@@ -272,7 +316,7 @@ class QueueManagementService:
     def _extract_track_ids_in_region(self, image: Any, region_points: list[tuple[int, int]]) -> list[int]:
         try:
             predict_kwargs: dict[str, Any] = {
-                "conf": settings.yolo_confidence,
+                "conf": 0.15,  # Decrease threshold to detect more human contours in queue
                 "iou": settings.yolo_iou,
                 "verbose": settings.yolo_verbose,
             }
