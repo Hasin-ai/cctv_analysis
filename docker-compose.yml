@@ -1,0 +1,43 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      SERVICE_ROLE: "fetcher"
+      DATABASE_URL: "sqlite+aiosqlite:///./data/app.db"
+      RTSP_INTERNAL_HOST: "host.docker.internal"
+      ANALYTICS_USE_YOLO: "true"
+      FRAME_INTERVAL_SECONDS: "0.3333333333"
+      YOLO_MODEL_PATH: "/app/data/models/best.pt"
+      YOLO_CONFIDENCE: "0.3"
+      BOXMOT_REID_WEIGHTS: "/app/data/models/osnet_x0_25_msmt17.pt"
+      PERSONVIT_REID_WEIGHTS: "/app/data/models/personvit/checkpoint0260.pth"
+      PERSONVIT_USE_REID: "true"
+      PERSONVIT_SIMILARITY_THRESHOLD: "0.6"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE: "http://backend:8000"
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_BASE: "http://backend:8000"
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
