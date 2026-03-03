@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -16,6 +16,14 @@ def _parse_datetime(value: str | None) -> datetime | None:
         return None
     cleaned = value.replace("Z", "+00:00")
     return datetime.fromisoformat(cleaned)
+
+
+def _to_utc_naive(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 async def create_zone(session: AsyncSession, camera_id: int, name: str, polygon: dict, capacity: int | None = None, expected_wait_time_sec: int | None = None):
@@ -74,9 +82,11 @@ async def get_footfall(
     camera = await crud.get_camera(session, camera_id)
     if not camera:
         raise HTTPException(status_code=404, detail="Camera not found")
+    source_url = (camera.rtsp_url or "").strip().lower()
+    source_type = "video" if source_url.startswith("file://") else "rtsp"
 
-    start_dt = _parse_datetime(start)
-    end_dt = _parse_datetime(end)
+    start_dt = _to_utc_naive(_parse_datetime(start))
+    end_dt = _to_utc_naive(_parse_datetime(end))
 
     payload = await crud.query_footfall(
         session=session,
@@ -84,6 +94,7 @@ async def get_footfall(
         start=start_dt,
         end=end_dt,
         zone_id=zone_id,
+        source_type=source_type,
     )
 
     return {
@@ -95,4 +106,45 @@ async def get_footfall(
         "net_flow": int(payload.get("net_flow", 0)),
         "series": list(payload.get("series", [])),
         "zone_totals": list(payload.get("zone_totals", [])),
+        "video_available_seconds": int(payload.get("video_available_seconds", 0)),
+        "video_available_hours": float(payload.get("video_available_hours", 0.0)),
+        "peak_traffic_hour": payload.get("peak_traffic_hour"),
+        "peak_person_count_hour": payload.get("peak_person_count_hour"),
+        "source_type": payload.get("source_type", source_type),
+        "most_crowded_quarter": payload.get("most_crowded_quarter"),
+    }
+
+
+async def get_zone_analysis(
+    session: AsyncSession,
+    camera_id: int,
+    start: str | None,
+    end: str | None,
+    zone_id: int | None,
+):
+    camera = await crud.get_camera(session, camera_id)
+    if not camera:
+        raise HTTPException(status_code=404, detail="Camera not found")
+
+    start_dt = _to_utc_naive(_parse_datetime(start))
+    end_dt = _to_utc_naive(_parse_datetime(end))
+    payload = await crud.query_zone_analysis(
+        session=session,
+        camera_id=camera_id,
+        start=start_dt,
+        end=end_dt,
+        zone_id=zone_id,
+    )
+
+    return {
+        "camera_id": camera_id,
+        "zone_id": zone_id,
+        "start_time": payload.get("start_time"),
+        "end_time": payload.get("end_time"),
+        "frame_interval_seconds": float(payload.get("frame_interval_seconds", 1.0)),
+        "congestion_by_zone": list(payload.get("congestion_by_zone", [])),
+        "tracked_paths": list(payload.get("tracked_paths", [])),
+        "heatmaps": list(payload.get("heatmaps", [])),
+        "service_staff_presence": list(payload.get("service_staff_presence", [])),
+        "summary": dict(payload.get("summary", {})),
     }

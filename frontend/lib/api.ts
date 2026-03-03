@@ -108,6 +108,30 @@ export type FootfallZoneTotal = {
   net_flow: number;
 };
 
+export type PeakPersonCountHour = {
+  hour_start: string | null;
+  hour_end: string | null;
+  person_count: number;
+  zone_id: number | null;
+  zone_name: string | null;
+};
+
+export type PeakTrafficHour = {
+  hour_start: string | null;
+  hour_end: string | null;
+  traffic_count: number;
+};
+
+export type MostCrowdedQuarter = {
+  quarter_index: number | null;
+  quarter_label: string | null;
+  start_time: string | null;
+  end_time: string | null;
+  person_count: number;
+  zone_id: number | null;
+  zone_name: string | null;
+};
+
 export type FootfallResponse = {
   camera_id: number;
   zone_id: number | null;
@@ -117,6 +141,100 @@ export type FootfallResponse = {
   net_flow: number;
   series: FootfallSeriesPoint[];
   zone_totals: FootfallZoneTotal[];
+  video_available_seconds: number;
+  video_available_hours: number;
+  peak_traffic_hour: PeakTrafficHour | null;
+  peak_person_count_hour: PeakPersonCountHour | null;
+  source_type: "rtsp" | "video" | string;
+  most_crowded_quarter: MostCrowdedQuarter | null;
+};
+
+export type ZoneCongestionMetric = {
+  zone_id: number;
+  zone_name: string;
+  is_service_zone: boolean;
+  capacity: number | null;
+  current_count: number;
+  peak_count: number;
+  avg_count: number;
+  current_utilization_pct: number | null;
+  peak_utilization_pct: number | null;
+  congestion_level: "low" | "medium" | "high" | "critical" | string;
+  latest_observed_at: string | null;
+};
+
+export type ZonePathPoint = {
+  timestamp: string;
+  zone_id: number;
+  x: number | null;
+  y: number | null;
+};
+
+export type ZonePathTrack = {
+  track_key: string;
+  job_id: number;
+  track_id: number;
+  track_type: "person" | "staff" | string;
+  first_seen: string;
+  last_seen: string;
+  detections: number;
+  estimated_dwell_seconds: number;
+  service_zone_ratio: number;
+  predominant_zone_id: number | null;
+  predominant_zone_name: string | null;
+  zone_sequence: number[];
+  zone_sequence_names: string[];
+  path_points: ZonePathPoint[];
+};
+
+export type ZoneHeatmap = {
+  zone_id: number;
+  zone_name: string;
+  grid_x: number;
+  grid_y: number;
+  max_cell_count: number;
+  grid: number[][];
+  normalized_grid: number[][];
+};
+
+export type ZoneServiceStaffPresence = {
+  zone_id: number;
+  zone_name: string;
+  is_service_zone: boolean;
+  person_tracks: number;
+  staff_tracks: number;
+  person_presence_seconds: number;
+  staff_presence_seconds: number;
+  total_presence_seconds: number;
+  staff_presence_ratio: number;
+};
+
+export type ZoneAnalysisSummary = {
+  total_zones: number;
+  service_zones: number;
+  tracked_paths: number;
+  estimated_staff_tracks: number;
+  estimated_person_tracks: number;
+  peak_congestion_zone?: {
+    zone_id: number;
+    zone_name: string;
+    congestion_level: string;
+    current_count: number;
+    peak_count: number;
+  } | null;
+};
+
+export type ZoneAnalysisResponse = {
+  camera_id: number;
+  zone_id: number | null;
+  start_time: string | null;
+  end_time: string | null;
+  frame_interval_seconds: number;
+  congestion_by_zone: ZoneCongestionMetric[];
+  tracked_paths: ZonePathTrack[];
+  heatmaps: ZoneHeatmap[];
+  service_staff_presence: ZoneServiceStaffPresence[];
+  summary: ZoneAnalysisSummary;
 };
 
 export type AnalyzerStatus = {
@@ -445,6 +563,17 @@ export async function deleteZone(zoneId: number) {
 export async function getFootfall(input: { cameraId: number; zoneId?: number | null; start?: string; end?: string }) {
   return request<FootfallResponse>(
     withQuery("/api/analytics/footfall", {
+      camera_id: input.cameraId,
+      zone_id: input.zoneId,
+      start: input.start,
+      end: input.end,
+    })
+  );
+}
+
+export async function getZoneAnalysis(input: { cameraId: number; zoneId?: number | null; start?: string; end?: string }) {
+  return request<ZoneAnalysisResponse>(
+    withQuery("/api/analytics/zone-analysis", {
       camera_id: input.cameraId,
       zone_id: input.zoneId,
       start: input.start,

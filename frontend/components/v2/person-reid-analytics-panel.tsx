@@ -97,7 +97,7 @@ export function PersonReidAnalyticsPanel({ cameraId }: { cameraId: number }) {
           setReconstructionStatus(`Generation Status: ${statusResult.status}`);
           if (statusResult.status === "completed") {
             if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-            setReconstructionVideoUrl(`/api/backend/api/reconstructions/${job.id}/download`);
+            setReconstructionVideoUrl(`/api/backend/api/v1/reconstructions/${job.id}/download`);
             setGeneratingVideo(false);
           } else if (statusResult.status === "failed") {
             if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);

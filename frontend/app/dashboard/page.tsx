@@ -4,23 +4,9 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Pencil, Pause, Play, Plus, Search, Trash2, Filter } from "lucide-react";
 
-import { 
-  type FootfallResponse, 
-  type Zone, 
-  getFootfall, 
-  listZones 
-} from "@/lib/api";
 import type { RealtimeZoneCount } from "@/lib/api";
+import { type FootfallResponse, type Zone, getFootfall, listZones } from "@/lib/api";
 import { useSourcesData } from "@/hooks/use-sources-data";
-
-type AnalyticsMode = "person_count" | "person_reid" | "entry_exit_count" | "queue";
-
-const ANALYTICS_MODES: { id: AnalyticsMode; label: string; desc: string }[] = [
-  { id: "person_count", label: "Person Count", desc: "Standard detection and unique IDs" },
-  { id: "queue", label: "Queue Management", desc: "Waiting times & line length" },
-  { id: "entry_exit_count", label: "Entry/Exit Count", desc: "Track line-crossing per zone" },
-  { id: "person_reid", label: "Person ReID", desc: "Track identities across frames" },
-];
 import {
   CameraFeed,
   MiniLineChart,
@@ -32,6 +18,25 @@ import {
 import { PersonReidAnalyticsPanel } from "@/components/v2/person-reid-analytics-panel";
 import { ZoneQuickEditor } from "@/components/v2/zone-quick-editor";
 import { QueueAnalyticsPanel } from "@/components/v2/queue-analytics-panel";
+import { ZoneAnalysisPanel } from "@/components/v2/zone-analysis-panel";
+
+type AnalyticsMode = "person_count" | "person_reid" | "entry_exit_count" | "queue";
+
+const ANALYTICS_MODES: { id: AnalyticsMode; label: string; desc: string }[] = [
+  { id: "person_count", label: "Person Count", desc: "Standard detection and unique IDs" },
+  { id: "queue", label: "Queue Management", desc: "Waiting times & line length" },
+  { id: "entry_exit_count", label: "Entry/Exit Count", desc: "Track line-crossing per zone" },
+  { id: "person_reid", label: "Person ReID", desc: "Track identities across frames" },
+];
+
+const ANALYTICS_SEARCH_TERMS: Record<AnalyticsMode, string[]> = {
+  person_count: ["person count", "person", "count", "crowd"],
+  queue: ["queue", "queue management", "line", "wait", "waiting"],
+  entry_exit_count: ["entry", "exit", "entry exit", "entry/exit", "extry", "extry exit"],
+  person_reid: ["person reid", "reid", "re-id", "identity", "track id"],
+};
+
+const ZONE_ANALYSIS_SEARCH_TERMS = ["zone analysis", "zone", "congestion", "path", "heatmap", "staff", "service"];
 
 type TimelinePoint = {
   ts: number;
@@ -42,10 +47,16 @@ function ModeAnalyticsPanel({
   timeline,
   zones = [],
   liveZones = [],
+  footfall = null,
+  isPersonCountMode = false,
+  sourceType = "RTSP",
 }: {
   timeline: TimelinePoint[];
   zones?: Zone[];
   liveZones?: RealtimeZoneCount[];
+  footfall?: FootfallResponse | null;
+  isPersonCountMode?: boolean;
+  sourceType?: "RTSP" | "Video File";
 }) {
   const current = timeline[timeline.length - 1] ?? {
     ts: Date.now(),
@@ -57,12 +68,51 @@ function ModeAnalyticsPanel({
       ? Math.round(timeline.reduce((sum, point) => sum + point.person, 0) / timeline.length)
       : 0;
 
+  const availableVideoHours = footfall?.video_available_hours ?? 0;
+  const peakHourPayload = footfall?.peak_person_count_hour ?? null;
+  const mostCrowdedQuarter = footfall?.most_crowded_quarter ?? null;
+  const isVideoSource = sourceType === "Video File";
+  const peakWindowLabel = formatTimeOnlyRange(peakHourPayload?.hour_start, peakHourPayload?.hour_end);
+  const peakWindowDate = formatDateLabel(peakHourPayload?.hour_start);
+  const peakHint =
+    peakWindowLabel === "N/A"
+      ? "No hourly person-count history"
+      : `${peakHourPayload?.zone_name ?? "Selected scope"} | ${peakWindowDate} | Max persons: ${peakHourPayload?.person_count ?? 0}`;
+  const crowdedQuarterRange = formatDateTimeRange(
+    mostCrowdedQuarter?.start_time,
+    mostCrowdedQuarter?.end_time,
+  );
+  const crowdedQuarterHint =
+    crowdedQuarterRange === "N/A"
+      ? "No quarter crowding history"
+      : `${mostCrowdedQuarter?.zone_name ?? "Selected scope"} | ${crowdedQuarterRange}`;
+
   return (
     <div className="space-y-3">
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
         <StatTile label="People Now" value={current.person} hint="Detected in frame" />
         <StatTile label="Peak" value={Math.max(...timeline.map((point) => point.person), 0)} hint="Current window" />
         <StatTile label="Average" value={avgPerson} hint="Rolling average" />
+        <StatTile
+          label="Video Available"
+          value={`${availableVideoHours.toFixed(2)}h`}
+          hint="Captured in selected window"
+        />
+        {isPersonCountMode ? (
+          isVideoSource ? (
+            <StatTile
+              label="Most Crowded Quarter"
+              value={mostCrowdedQuarter?.quarter_label ?? "N/A"}
+              hint={crowdedQuarterHint}
+            />
+          ) : (
+            <StatTile
+              label="Peak Hour Window"
+              value={peakWindowLabel}
+              hint={peakHint}
+            />
+          )
+        ) : null}
       </div>
       <div className="rounded-xl border border-border/70 bg-white/80 p-3">
         <MiniLineChart values={timeline.map((point) => point.person)} />
@@ -199,38 +249,14 @@ function EntryExitAnalyticsPanel({
     return results;
   }, [footfall, selectedZoneId]);
 
-  const peakHourStr = useMemo(() => {
-    if (!footfall || footfall.series.length === 0) return "N/A";
-    const hourlyVolumes = new Map<string, number>();
-    
-    for (const pt of footfall.series) {
-      // Respect zone filtering
-      if (selectedZoneId && selectedZoneId !== "all" && pt.zone_id !== Number(selectedZoneId)) {
-        continue;
-      }
-      
-      const date = new Date(pt.timestamp);
-      if (Number.isNaN(date.getTime())) continue;
-      
-      // Standardize hour bucketing strings e.g. "02:00 PM"
-      const hourStr = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true }).replace(/:\d{2}/, ':00');
-      
-      const count = pt.entry_count + pt.exit_count;
-      hourlyVolumes.set(hourStr, (hourlyVolumes.get(hourStr) || 0) + count);
-    }
-    
-    if (hourlyVolumes.size === 0) return "N/A";
-    
-    let peak = "N/A";
-    let max = -1;
-    for (const [hr, vol] of hourlyVolumes.entries()) {
-      if (vol > max) {
-        max = vol;
-        peak = hr;
-      }
-    }
-    return max > 0 ? `${peak}` : "N/A";
-  }, [footfall, selectedZoneId]);
+  const peakTrafficWindow = useMemo(
+    () => formatTimeOnlyRange(footfall?.peak_traffic_hour?.hour_start, footfall?.peak_traffic_hour?.hour_end),
+    [footfall],
+  );
+  const peakTrafficDate = useMemo(
+    () => formatDateLabel(footfall?.peak_traffic_hour?.hour_start),
+    [footfall],
+  );
 
   if (!footfall) {
     return <p className="text-sm text-muted-foreground">No entry/exit analytics available yet for this camera.</p>;
@@ -250,7 +276,15 @@ function EntryExitAnalyticsPanel({
         <StatTile label="Total Entries" value={footfall.total_entries} hint="Tracked with ByteTrack IDs" />
         <StatTile label="Total Exits" value={footfall.total_exits} hint="Tracked with ByteTrack IDs" />
         <StatTile label="Net Flow" value={footfall.net_flow} hint="Entries minus exits" />
-        <StatTile label="Peak Hour" value={peakHourStr} hint="Highest traffic window" />
+        <StatTile
+          label="Peak Hour Window"
+          value={peakTrafficWindow}
+          hint={
+            peakTrafficWindow === "N/A"
+              ? "Highest traffic window"
+              : `${peakTrafficDate} | Traffic: ${footfall.peak_traffic_hour?.traffic_count ?? 0}`
+          }
+        />
         <StatTile label="Estimated Occupancy" value={Math.max(footfall.net_flow, 0)} hint="Derived occupancy trend" />
       </div>
 
@@ -351,6 +385,46 @@ function EntryExitAnalyticsPanel({
 
 function hoursAgoIso(hours: number): string {
   return new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+}
+
+function formatDateTimeRange(start: string | null | undefined, end: string | null | undefined): string {
+  if (!start || !end) return "N/A";
+  const parsedStart = new Date(start);
+  const parsedEnd = new Date(end);
+  if (Number.isNaN(parsedStart.getTime()) || Number.isNaN(parsedEnd.getTime())) return "N/A";
+  const s = parsedStart.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: true });
+  const e = parsedEnd.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: true });
+  return `${s} to ${e}`;
+}
+
+function formatTimeOnlyRange(start: string | null | undefined, end: string | null | undefined): string {
+  if (!start || !end) return "N/A";
+  const parsedStart = new Date(start);
+  const parsedEnd = new Date(end);
+  if (Number.isNaN(parsedStart.getTime()) || Number.isNaN(parsedEnd.getTime())) return "N/A";
+  const s = parsedStart.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", hour12: true }).toLowerCase();
+  const e = parsedEnd.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", hour12: true }).toLowerCase();
+
+  const sMatch = /^(\d{1,2}:\d{2})\s*([ap]m)$/.exec(s);
+  const eMatch = /^(\d{1,2}:\d{2})\s*([ap]m)$/.exec(e);
+  if (!sMatch || !eMatch) return `${s}-${e}`;
+
+  const sTime = sMatch[1];
+  const sPeriod = sMatch[2];
+  const eTime = eMatch[1];
+  const ePeriod = eMatch[2];
+
+  if (sPeriod === ePeriod) {
+    return `${sTime}-${eTime} ${ePeriod}`;
+  }
+  return `${sTime} ${sPeriod}-${eTime} ${ePeriod}`;
+}
+
+function formatDateLabel(value: string | null | undefined): string {
+  if (!value) return "N/A";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "N/A";
+  return parsed.toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" });
 }
 
 export default function DashboardPage() {
@@ -502,6 +576,29 @@ export default function DashboardPage() {
     if (!selected) return null;
     return footfallByCamera[selected.camera.id] ?? null;
   }, [footfallByCamera, selected]);
+
+  const analyticsQuery = analyticsSearchQuery.trim().toLowerCase();
+  const hasAnalyticsQuery = analyticsQuery.length > 0;
+  const matchesAnalyticsPanel = useCallback(
+    (mode: AnalyticsMode): boolean => {
+      if (!hasAnalyticsQuery) return true;
+      const terms = ANALYTICS_SEARCH_TERMS[mode];
+      return terms.some((term) => term.includes(analyticsQuery) || analyticsQuery.includes(term));
+    },
+    [analyticsQuery, hasAnalyticsQuery],
+  );
+  const showPersonCountPanel = matchesAnalyticsPanel("person_count");
+  const showEntryExitPanel = matchesAnalyticsPanel("entry_exit_count");
+  const showPersonReidPanel = matchesAnalyticsPanel("person_reid");
+  const queueMatchedBySearch = matchesAnalyticsPanel("queue");
+  const showZoneAnalysisPanel =
+    !hasAnalyticsQuery ||
+    ZONE_ANALYSIS_SEARCH_TERMS.some((term) => term.includes(analyticsQuery) || analyticsQuery.includes(term));
+  const showQueuePanel = queueMatchedBySearch && overlayMode === "queue";
+  const showQueueOverlayHint = hasAnalyticsQuery && queueMatchedBySearch && overlayMode !== "queue";
+  const hasMatchedAnalyticsPanel =
+    showPersonCountPanel || showEntryExitPanel || showPersonReidPanel || showQueuePanel || showZoneAnalysisPanel || showQueueOverlayHint;
+  const entryExitZoneSearchQuery = "";
 
 
 
@@ -785,7 +882,7 @@ export default function DashboardPage() {
                 <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
                 <input
                   type="text"
-                  placeholder="Search analytics by zone..."
+                  placeholder="Search analytics: person, queue, reid, entry/exit, zone..."
                   value={analyticsSearchQuery}
                   onChange={(e) => setAnalyticsSearchQuery(e.target.value)}
                   className="h-9 w-full rounded-lg border border-input bg-white pl-9 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary"
@@ -795,28 +892,72 @@ export default function DashboardPage() {
           </div>
 
           <div className="grid gap-3">
-            <PanelCard title="Zone Analytics" subtitle="Person Count">
-              <ModeAnalyticsPanel timeline={selectedTimeline} zones={zonesByCamera[selected.camera.id] ?? []} liveZones={selected?.realtime?.zones ?? []} />
-            </PanelCard>
+            {hasAnalyticsQuery && !hasMatchedAnalyticsPanel ? (
+              <div className="rounded-xl border border-border/70 bg-white px-4 py-3 text-sm text-muted-foreground">
+                No analytics section matches {analyticsSearchQuery.trim()}. Try: person count, queue management, person reid, entry exit, zone analysis.
+              </div>
+            ) : null}
 
-            <PanelCard
-              title="Entry / Exit Analytics"
-              subtitle="YOLO + ByteTrack zone transitions"
-            >
-              <EntryExitAnalyticsPanel footfall={selectedFootfall} liveZones={selected?.realtime?.zones ?? []} searchQuery={analyticsSearchQuery} selectedZoneId={selectedZoneId} />
-            </PanelCard>
+            {showPersonCountPanel ? (
+              <PanelCard title="Zone Analytics" subtitle="Person Count">
+                <ModeAnalyticsPanel
+                  timeline={selectedTimeline}
+                  zones={zonesByCamera[selected.camera.id] ?? []}
+                  liveZones={selected?.realtime?.zones ?? []}
+                  footfall={selectedFootfall}
+                  isPersonCountMode={overlayMode === "person_count"}
+                  sourceType={selected.type}
+                />
+              </PanelCard>
+            ) : null}
 
-            <PanelCard title="Person ReID Analytics" subtitle="Track occurrences and dwell times across views">
-              <PersonReidAnalyticsPanel cameraId={selected.camera.id} />
-            </PanelCard>
-            
-            <PanelCard title="Queue Management" subtitle="Waiting times & line length">
-              <QueueAnalyticsPanel
-                cameraId={selected.camera.id}
-                zones={zonesByCamera[selected.camera.id] ?? []}
-                selectedZoneId={selectedZoneId}
-              />
-            </PanelCard>
+            {showZoneAnalysisPanel ? (
+              <PanelCard
+                title="Zone Analysis"
+                subtitle="Monitor congestion, people/staff paths, heatmaps, and service presence"
+              >
+                <ZoneAnalysisPanel
+                  cameraId={selected.camera.id}
+                  selectedZoneId={selectedZoneId}
+                  start={getStartTimestamp()}
+                />
+              </PanelCard>
+            ) : null}
+
+            {showEntryExitPanel ? (
+              <PanelCard
+                title="Entry / Exit Analytics"
+                subtitle="YOLO + ByteTrack zone transitions"
+              >
+                <EntryExitAnalyticsPanel
+                  footfall={selectedFootfall}
+                  liveZones={selected?.realtime?.zones ?? []}
+                  searchQuery={entryExitZoneSearchQuery}
+                  selectedZoneId={selectedZoneId}
+                />
+              </PanelCard>
+            ) : null}
+
+            {showPersonReidPanel ? (
+              <PanelCard title="Person ReID Analytics" subtitle="Track occurrences and dwell times across views">
+                <PersonReidAnalyticsPanel cameraId={selected.camera.id} />
+              </PanelCard>
+            ) : null}
+
+            {showQueuePanel ? (
+              <PanelCard title="Queue Management" subtitle="Waiting times & line length">
+                <QueueAnalyticsPanel
+                  cameraId={selected.camera.id}
+                  zones={zonesByCamera[selected.camera.id] ?? []}
+                  selectedZoneId={selectedZoneId}
+                />
+              </PanelCard>
+            ) : null}
+            {showQueueOverlayHint ? (
+              <div className="rounded-xl border border-border/70 bg-white px-4 py-3 text-xs text-muted-foreground">
+                Queue Management analytics appears when overlay mode is set to Queue Management.
+              </div>
+            ) : null}
           </div>
         </div>
       ) : null}

@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.controllers import analytics_controller
 from app.db.session import get_session
-from app.schemas import FootfallResponse, ZoneCreate, ZoneRead
+from app.schemas import FootfallResponse, ZoneAnalysisResponse, ZoneCreate, ZoneRead
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
@@ -52,3 +52,14 @@ async def get_footfall(
     session: AsyncSession = Depends(get_session),
 ):
     return await analytics_controller.get_footfall(session, camera_id, start, end, zone_id)
+
+
+@router.get("/zone-analysis", response_model=ZoneAnalysisResponse)
+async def get_zone_analysis(
+    camera_id: int = Query(...),
+    start: str | None = Query(default=None),
+    end: str | None = Query(default=None),
+    zone_id: int | None = Query(default=None),
+    session: AsyncSession = Depends(get_session),
+):
+    return await analytics_controller.get_zone_analysis(session, camera_id, start, end, zone_id)
