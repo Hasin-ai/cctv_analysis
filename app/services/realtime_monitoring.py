@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from app.core.config import settings
+from app.services.yolo_threadsafe import build_locked_callable
 from app.services.yolo_person_classes import resolve_person_class_ids
 from app.services.zone_geometry import region_points_from_polygon
 
@@ -29,6 +30,7 @@ class RealtimeMonitoringService:
     def __init__(self) -> None:
         self._use_yolo = settings.analytics_use_yolo
         self._yolo = None
+        self._predict = None
         self._cv2 = None
         self._np = None
         self._person_class_ids: list[int] = [0]
@@ -44,6 +46,7 @@ class RealtimeMonitoringService:
             import numpy as np  # type: ignore
 
             self._yolo = YOLO(settings.yolo_model_path)
+            self._predict = build_locked_callable(self._yolo.predict)
             self._cv2 = cv2
             self._np = np
             self._person_class_ids = resolve_person_class_ids(self._yolo)
@@ -52,7 +55,13 @@ class RealtimeMonitoringService:
             self._use_yolo = False
 
     def is_available(self) -> bool:
-        return self._use_yolo and self._yolo is not None and self._cv2 is not None and self._np is not None
+        return (
+            self._use_yolo
+            and self._yolo is not None
+            and self._predict is not None
+            and self._cv2 is not None
+            and self._np is not None
+        )
 
     def count_people(self, frame_path: str, zones: list[Any]) -> dict[str, Any]:
         default_counts = {int(getattr(zone, "id", 0)): 0 for zone in zones}
@@ -130,7 +139,7 @@ class RealtimeMonitoringService:
             }
             if self._person_class_ids:
                 predict_kwargs["classes"] = self._person_class_ids
-            results = self._yolo.predict(image, **predict_kwargs)
+            results = self._predict(image, **predict_kwargs)
             boxes = results[0].boxes if results and results[0].boxes is not None else None
             if boxes is None:
                 xyxy = self._np.empty((0, 4), dtype=self._np.float32)

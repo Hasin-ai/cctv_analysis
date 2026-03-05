@@ -19,11 +19,20 @@ import { PersonReidAnalyticsPanel } from "@/components/v2/person-reid-analytics-
 import { ZoneQuickEditor } from "@/components/v2/zone-quick-editor";
 import { QueueAnalyticsPanel } from "@/components/v2/queue-analytics-panel";
 import { ZoneAnalysisPanel } from "@/components/v2/zone-analysis-panel";
+import { FacialExpressionPanel } from "@/components/v2/facial-expression-panel";
 
-type AnalyticsMode = "person_count" | "person_reid" | "entry_exit_count" | "queue";
+type AnalyticsMode =
+  | "person_count"
+  | "person_reid"
+  | "entry_exit_count"
+  | "queue"
+  | "facial_expression"
+  | "trajectory_heatmap";
 
 const ANALYTICS_MODES: { id: AnalyticsMode; label: string; desc: string }[] = [
   { id: "person_count", label: "Person Count", desc: "Standard detection and unique IDs" },
+  { id: "trajectory_heatmap", label: "Trajectory Heatmap", desc: "Object tracking trajectory-density overlay" },
+  { id: "facial_expression", label: "Facial Expression", desc: "Emotion recognition in a selected zone" },
   { id: "queue", label: "Queue Management", desc: "Waiting times & line length" },
   { id: "entry_exit_count", label: "Entry/Exit Count", desc: "Track line-crossing per zone" },
   { id: "person_reid", label: "Person ReID", desc: "Track identities across frames" },
@@ -31,12 +40,15 @@ const ANALYTICS_MODES: { id: AnalyticsMode; label: string; desc: string }[] = [
 
 const ANALYTICS_SEARCH_TERMS: Record<AnalyticsMode, string[]> = {
   person_count: ["person count", "person", "count", "crowd"],
+  trajectory_heatmap: ["trajectory", "heatmap", "path heatmap", "tracking heatmap", "object tracking heatmap"],
+  facial_expression: ["facial expression", "expression", "emotion", "facial", "face emotion"],
   queue: ["queue", "queue management", "line", "wait", "waiting"],
   entry_exit_count: ["entry", "exit", "entry exit", "entry/exit", "extry", "extry exit"],
   person_reid: ["person reid", "reid", "re-id", "identity", "track id"],
 };
 
 const ZONE_ANALYSIS_SEARCH_TERMS = ["zone analysis", "zone", "congestion", "path", "heatmap", "staff", "service"];
+const OVERLAY_MODE_STORAGE_KEY = "dashboard_overlay_mode";
 
 type TimelinePoint = {
   ts: number;
@@ -48,6 +60,7 @@ function ModeAnalyticsPanel({
   zones = [],
   liveZones = [],
   footfall = null,
+  selectedZoneId = "all",
   isPersonCountMode = false,
   sourceType = "RTSP",
 }: {
@@ -55,8 +68,9 @@ function ModeAnalyticsPanel({
   zones?: Zone[];
   liveZones?: RealtimeZoneCount[];
   footfall?: FootfallResponse | null;
+  selectedZoneId?: string;
   isPersonCountMode?: boolean;
-  sourceType?: "RTSP" | "Video File";
+  sourceType?: "RTSP" | "Video File" | string;
 }) {
   const current = timeline[timeline.length - 1] ?? {
     ts: Date.now(),
@@ -118,7 +132,7 @@ function ModeAnalyticsPanel({
         <MiniLineChart values={timeline.map((point) => point.person)} />
       </div>
       
-      {zones.length > 0 && (
+      {zones.length > 0 && (!selectedZoneId || selectedZoneId === "all") && (
         <div className="overflow-x-auto rounded-xl border border-border/70 bg-white/80 mt-3">
           <table className="min-w-full text-left text-xs">
             <thead className="bg-muted/40 text-muted-foreground">
@@ -206,47 +220,20 @@ function EntryExitAnalyticsPanel({
     });
   }, [footfall, searchQuery, selectedZoneId, liveZones]);
 
-  const seriesByZone = useMemo(() => {
-    if (!footfall) return [];
-    
-    // Group series by zone
-    const map = new Map<number | null, typeof footfall.series>();
-    for (const pt of footfall.series) {
-      if (!map.has(pt.zone_id)) map.set(pt.zone_id, []);
-      map.get(pt.zone_id)!.push(pt);
-    }
-    
-    // Convert to target format
-    const results = Array.from(map.entries()).map(([zId, pts]) => {
-      const recent = pts.slice(-36);
-      
-      const netSeries = recent.reduce<number[]>((acc, p) => {
-        const prev = acc[acc.length - 1] ?? 0;
-        acc.push(prev + p.net_count);
-        return acc;
-      }, []);
+  const activeZoneSeriesData = useMemo(() => {
+    if (!footfall || !selectedZoneId || selectedZoneId === "all") return null;
+    const zNum = Number(selectedZoneId);
+    if (Number.isNaN(zNum)) return null;
 
-      const zName = footfall.zone_totals?.find(t => t.zone_id === zId)?.zone_name ?? (zId === null ? "Global Tracking" : `Zone ${zId}`);
-      
-      const colors = ["#0f766e", "#ea580c", "#1d4ed8", "#dc2626", "#7c3aed", "#15803d"];
-      const cIdx = zId ? zId % colors.length : 0;
-      
-      return {
-        id: zId ?? "global",
-        name: zName,
-        color: colors[cIdx],
-        entryValues: recent.map(p => p.entry_count),
-        exitValues: recent.map(p => p.exit_count),
-        netValues: netSeries,
-      };
-    });
-    
-    // Apply filters
-    if (selectedZoneId && selectedZoneId !== "all") {
-        const zNum = Number(selectedZoneId);
-        return results.filter(r => r.id === zNum);
-    }
-    return results;
+    const zName = footfall.zone_totals?.find(t => t.zone_id === zNum)?.zone_name ?? `Zone ${zNum}`;
+    const pts = footfall.series.filter(pt => pt.zone_id === zNum);
+    const recent = pts.slice(-36);
+
+    return {
+      name: zName,
+      entries: { id: "in", name: "Entries", color: "#0f766e", values: recent.map(p => p.entry_count) },
+      exits: { id: "out", name: "Exits", color: "#dc2626", values: recent.map(p => p.exit_count) },
+    };
   }, [footfall, selectedZoneId]);
 
   const peakTrafficWindow = useMemo(
@@ -288,62 +275,26 @@ function EntryExitAnalyticsPanel({
         <StatTile label="Estimated Occupancy" value={Math.max(footfall.net_flow, 0)} hint="Derived occupancy trend" />
       </div>
 
-      <div className="grid gap-3 lg:grid-cols-3">
+      {selectedZoneId && selectedZoneId !== "all" && activeZoneSeriesData ? (
         <div className="rounded-xl border border-border/70 bg-white/80 p-3">
-          <p className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">Entry Trend (Multi-Zone)</p>
-          {seriesByZone.length > 0 ? (
-            <div className="mb-2 space-y-2">
-              <MultiZoneLineChart series={seriesByZone.map(s => ({ id: s.id, name: s.name, color: s.color, values: s.entryValues }))} />
-              <div className="flex flex-wrap gap-2 text-[10px] font-semibold">
-                {seriesByZone.map(s => (
-                  <div key={s.id} className="flex items-center gap-1">
-                    <div className="h-2 w-2 rounded-full" style={{ backgroundColor: s.color }} />
-                    <span className="text-muted-foreground">{s.name}</span>
-                  </div>
-                ))}
+          <p className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">Traffic Trend ({activeZoneSeriesData.name})</p>
+          <div className="mb-2 space-y-2">
+            <MultiZoneLineChart series={[activeZoneSeriesData.entries, activeZoneSeriesData.exits]} />
+            <div className="flex flex-wrap gap-2 text-[10px] font-semibold">
+              <div className="flex items-center gap-1">
+                <div className="h-2 w-2 rounded-full" style={{ backgroundColor: activeZoneSeriesData.entries.color }} />
+                <span className="text-muted-foreground">Entries</span>
+              </div>
+              <div className="flex items-center gap-1">
+                <div className="h-2 w-2 rounded-full" style={{ backgroundColor: activeZoneSeriesData.exits.color }} />
+                <span className="text-muted-foreground">Exits</span>
               </div>
             </div>
-          ) : (
-            <p className="text-xs text-muted-foreground">No trend points yet.</p>
-          )}
+          </div>
         </div>
-        <div className="rounded-xl border border-border/70 bg-white/80 p-3">
-          <p className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">Exit Trend (Multi-Zone)</p>
-          {seriesByZone.length > 0 ? (
-            <div className="mb-2 space-y-2">
-              <MultiZoneLineChart series={seriesByZone.map(s => ({ id: s.id, name: s.name, color: s.color, values: s.exitValues }))} />
-              <div className="flex flex-wrap gap-2 text-[10px] font-semibold">
-                {seriesByZone.map(s => (
-                  <div key={s.id} className="flex items-center gap-1">
-                    <div className="h-2 w-2 rounded-full" style={{ backgroundColor: s.color }} />
-                    <span className="text-muted-foreground">{s.name}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          ) : (
-            <p className="text-xs text-muted-foreground">No trend points yet.</p>
-          )}
-        </div>
-        <div className="rounded-xl border border-border/70 bg-white/80 p-3">
-          <p className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">Net Trend / Occupancy</p>
-          {seriesByZone.length > 0 ? (
-            <div className="mb-2 space-y-2">
-              <MultiZoneLineChart series={seriesByZone.map(s => ({ id: s.id, name: s.name, color: s.color, values: s.netValues }))} />
-              <div className="flex flex-wrap gap-2 text-[10px] font-semibold">
-                {seriesByZone.map(s => (
-                  <div key={s.id} className="flex items-center gap-1">
-                    <div className="h-2 w-2 rounded-full" style={{ backgroundColor: s.color }} />
-                    <span className="text-muted-foreground">{s.name}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          ) : (
-            <p className="text-xs text-muted-foreground">No trend points yet.</p>
-          )}
-        </div>
-      </div>
+      ) : (
+        <p className="text-sm text-muted-foreground italic my-4 px-2">Select a specific zone from the primary feed controls to view its traffic trend.</p>
+      )}
 
       <div className="overflow-x-auto rounded-xl border border-border/70 bg-white/80">
         <table className="min-w-full text-left text-xs">
@@ -429,6 +380,8 @@ function formatDateLabel(value: string | null | undefined): string {
 
 export default function DashboardPage() {
   const router = useRouter();
+  const [overlayMode, setOverlayMode] = useState<AnalyticsMode>("person_count");
+  const enableRealtimeMonitoring = true;
   const {
     busy,
     error,
@@ -441,12 +394,11 @@ export default function DashboardPage() {
     toggleStreamForCamera,
     deleteSourceByCamera,
 
-  } = useSourcesData();
+  } = useSourcesData({ enableRealtime: enableRealtimeMonitoring });
 
   const [selectedCameraId, setSelectedCameraId] = useState<number | null>(null);
   const [queryCameraId, setQueryCameraId] = useState<number | null>(null);
   const [selectedZoneId, setSelectedZoneId] = useState<string>("all");
-  const [overlayMode, setOverlayMode] = useState<AnalyticsMode>("person_count");
   const [historyByCamera, setHistoryByCamera] = useState<Record<string, TimelinePoint[]>>({});
   const [zonesByCamera, setZonesByCamera] = useState<Record<number, Zone[]>>({});
   const [footfallByCamera, setFootfallByCamera] = useState<Record<number, FootfallResponse>>({});
@@ -454,6 +406,21 @@ export default function DashboardPage() {
   const [analyticsSearchQuery, setAnalyticsSearchQuery] = useState("");
   const [timeRange, setTimeRange] = useState<"12h" | "today" | "24h">("today");
   const [showZoneEditor, setShowZoneEditor] = useState(false);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const stored = window.localStorage.getItem(OVERLAY_MODE_STORAGE_KEY);
+    if (!stored) return;
+    const valid = ANALYTICS_MODES.some((mode) => mode.id === stored);
+    if (valid) {
+      setOverlayMode(stored as AnalyticsMode);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(OVERLAY_MODE_STORAGE_KEY, overlayMode);
+  }, [overlayMode]);
 
   const getStartTimestamp = useCallback(() => {
     if (timeRange === "12h") return hoursAgoIso(12);
@@ -490,7 +457,7 @@ export default function DashboardPage() {
   }, [selectedCameraId, sourceById, sources]);
 
   useEffect(() => {
-    if (!analyticsRunning) return;
+    if (!analyticsRunning || overlayMode !== "person_count") return;
     setHistoryByCamera((previous) => {
       const next = { ...previous };
 
@@ -517,7 +484,7 @@ export default function DashboardPage() {
 
       return next;
     });
-  }, [analyticsRunning, sources, selectedZoneId]);
+  }, [analyticsRunning, overlayMode, sources, selectedZoneId]);
 
   const loadZones = useCallback(async (cameraId: number) => {
     try {
@@ -537,6 +504,20 @@ export default function DashboardPage() {
     return () => window.clearInterval(id);
   }, [loadZones, selectedCameraId]);
 
+  useEffect(() => {
+    if (selectedZoneId === "all") return;
+    if (!selectedCameraId) {
+      setSelectedZoneId("all");
+      return;
+    }
+
+    const cameraZones = zonesByCamera[selectedCameraId] ?? [];
+    const zoneExists = cameraZones.some((zone) => zone.id.toString() === selectedZoneId);
+    if (!zoneExists) {
+      setSelectedZoneId("all");
+    }
+  }, [selectedCameraId, selectedZoneId, zonesByCamera]);
+
   const loadFootfall = useCallback(async (cameraId: number, zoneId: string) => {
     try {
       const payload = await getFootfall({
@@ -554,13 +535,14 @@ export default function DashboardPage() {
   }, [getStartTimestamp]);
 
   useEffect(() => {
-    if (!selectedCameraId) return;
+    const shouldPollFootfall = overlayMode === "person_count" || overlayMode === "entry_exit_count";
+    if (!selectedCameraId || !shouldPollFootfall) return;
     void loadFootfall(selectedCameraId, selectedZoneId);
     const id = window.setInterval(() => {
       void loadFootfall(selectedCameraId, selectedZoneId);
     }, 5000);
     return () => window.clearInterval(id);
-  }, [loadFootfall, selectedCameraId, selectedZoneId]);
+  }, [loadFootfall, overlayMode, selectedCameraId, selectedZoneId]);
 
   const selected = selectedCameraId ? sourceById.get(selectedCameraId) ?? null : null;
   const selectedTimeline = useMemo(() => {
@@ -587,17 +569,28 @@ export default function DashboardPage() {
     },
     [analyticsQuery, hasAnalyticsQuery],
   );
-  const showPersonCountPanel = matchesAnalyticsPanel("person_count");
-  const showEntryExitPanel = matchesAnalyticsPanel("entry_exit_count");
-  const showPersonReidPanel = matchesAnalyticsPanel("person_reid");
+  const showPersonCountPanel = overlayMode === "person_count" && matchesAnalyticsPanel("person_count");
+  const showTrajectoryHeatmapPanel =
+    overlayMode === "trajectory_heatmap" && matchesAnalyticsPanel("trajectory_heatmap");
+  const showFacialExpressionPanel = overlayMode === "facial_expression" && matchesAnalyticsPanel("facial_expression");
+  const showEntryExitPanel = overlayMode === "entry_exit_count" && matchesAnalyticsPanel("entry_exit_count");
+  const showPersonReidPanel = overlayMode === "person_reid" && matchesAnalyticsPanel("person_reid");
   const queueMatchedBySearch = matchesAnalyticsPanel("queue");
   const showZoneAnalysisPanel =
-    !hasAnalyticsQuery ||
-    ZONE_ANALYSIS_SEARCH_TERMS.some((term) => term.includes(analyticsQuery) || analyticsQuery.includes(term));
+    overlayMode === "person_count" &&
+    (!hasAnalyticsQuery ||
+      ZONE_ANALYSIS_SEARCH_TERMS.some((term) => term.includes(analyticsQuery) || analyticsQuery.includes(term)));
   const showQueuePanel = queueMatchedBySearch && overlayMode === "queue";
   const showQueueOverlayHint = hasAnalyticsQuery && queueMatchedBySearch && overlayMode !== "queue";
   const hasMatchedAnalyticsPanel =
-    showPersonCountPanel || showEntryExitPanel || showPersonReidPanel || showQueuePanel || showZoneAnalysisPanel || showQueueOverlayHint;
+    showPersonCountPanel ||
+    showTrajectoryHeatmapPanel ||
+    showFacialExpressionPanel ||
+    showEntryExitPanel ||
+    showPersonReidPanel ||
+    showQueuePanel ||
+    showZoneAnalysisPanel ||
+    showQueueOverlayHint;
   const entryExitZoneSearchQuery = "";
 
 
@@ -798,7 +791,7 @@ export default function DashboardPage() {
             {selected ? (
               <>
                 <CameraFeed
-                  key={`primary-${selected.camera.id}-${analyticsRunning ? "live" : "static"}`}
+                  key={`primary-${selected.camera.id}`}
                   cameraId={selected.camera.id}
                   title={selected.camera.name}
                   status={selected.status}
@@ -807,7 +800,7 @@ export default function DashboardPage() {
                   zones={zonesByCamera[selected.camera.id] ?? []}
                   detectionBoxes={selected.realtime?.detection_boxes ?? []}
                   hasLiveFrame={selected.hasLiveFrame}
-                  staticFirstFrame={!analyticsRunning}
+                  staticFirstFrame={false}
                   analyticsMode={overlayMode}
                   zoneId={selectedZoneId !== "all" ? selectedZoneId : undefined}
                 />
@@ -838,7 +831,7 @@ export default function DashboardPage() {
                             detectionBoxes={selected.realtime?.detection_boxes ?? []}
                             hasLiveFrame={selected.hasLiveFrame}
                             compact
-                            staticFirstFrame={!analyticsRunning}
+                            staticFirstFrame={false}
                             analyticsMode={overlayMode}
                             zoneId={zone.id.toString()}
                           />
@@ -882,7 +875,7 @@ export default function DashboardPage() {
                 <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
                 <input
                   type="text"
-                  placeholder="Search analytics: person, queue, reid, entry/exit, zone..."
+                  placeholder="Search analytics: person, emotion, queue, reid, entry/exit, zone..."
                   value={analyticsSearchQuery}
                   onChange={(e) => setAnalyticsSearchQuery(e.target.value)}
                   className="h-9 w-full rounded-lg border border-input bg-white pl-9 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary"
@@ -894,7 +887,7 @@ export default function DashboardPage() {
           <div className="grid gap-3">
             {hasAnalyticsQuery && !hasMatchedAnalyticsPanel ? (
               <div className="rounded-xl border border-border/70 bg-white px-4 py-3 text-sm text-muted-foreground">
-                No analytics section matches {analyticsSearchQuery.trim()}. Try: person count, queue management, person reid, entry exit, zone analysis.
+                No analytics section matches {analyticsSearchQuery.trim()}. Try: person count, facial expression, queue management, person reid, entry exit, zone analysis.
               </div>
             ) : null}
 
@@ -905,8 +898,36 @@ export default function DashboardPage() {
                   zones={zonesByCamera[selected.camera.id] ?? []}
                   liveZones={selected?.realtime?.zones ?? []}
                   footfall={selectedFootfall}
+                  selectedZoneId={selectedZoneId}
                   isPersonCountMode={overlayMode === "person_count"}
                   sourceType={selected.type}
+                />
+              </PanelCard>
+            ) : null}
+
+            {showTrajectoryHeatmapPanel ? (
+              <PanelCard
+                title="Object Tracking-Based Heatmaps"
+                subtitle="Trajectory density overlay from YOLO + BoxMOT tracks"
+              >
+                <div className="rounded-xl border border-border/70 bg-white/80 px-4 py-3 text-sm text-slate-700">
+                  Trajectory heatmap overlay is active on the video feed.
+                  {selectedZoneId !== "all"
+                    ? " Density is computed from tracked object paths inside the selected zone."
+                    : " Density is computed from tracked object paths across the full frame."}
+                </div>
+              </PanelCard>
+            ) : null}
+
+            {showFacialExpressionPanel ? (
+              <PanelCard
+                title="Facial Expression Recognition"
+                subtitle="Emotion recognition for faces detected inside the selected zone"
+              >
+                <FacialExpressionPanel
+                  cameraId={selected.camera.id}
+                  selectedZoneId={selectedZoneId}
+                  start={getStartTimestamp()}
                 />
               </PanelCard>
             ) : null}
@@ -940,7 +961,7 @@ export default function DashboardPage() {
 
             {showPersonReidPanel ? (
               <PanelCard title="Person ReID Analytics" subtitle="Track occurrences and dwell times across views">
-                <PersonReidAnalyticsPanel cameraId={selected.camera.id} />
+                <PersonReidAnalyticsPanel cameraId={selected.camera.id} selectedZoneId={selectedZoneId} />
               </PanelCard>
             ) : null}
 

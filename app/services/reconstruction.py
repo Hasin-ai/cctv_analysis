@@ -7,13 +7,44 @@ import subprocess
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from app.core.config import settings
 from app.db import crud
 from app.db.models import ReconstructionStatus
+from app.services.facial_expression_recognition import FacialExpressionRecognitionService
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_zone_polygons(polygon_payload: Any) -> list[list[Any]]:
+    if isinstance(polygon_payload, dict):
+        raw_polygons = polygon_payload.get("polygons")
+        if isinstance(raw_polygons, list):
+            return [poly for poly in raw_polygons if isinstance(poly, list)]
+        points = polygon_payload.get("points")
+        if isinstance(points, list):
+            return [points]
+        return []
+
+    if isinstance(polygon_payload, list):
+        if polygon_payload and isinstance(polygon_payload[0], list):
+            return [poly for poly in polygon_payload if isinstance(poly, list)]
+        return [polygon_payload]
+
+    return []
+
+
+def _zone_filter_from_zones(zones: list[Any]) -> Any | None:
+    polygons: list[list[Any]] = []
+    for zone in zones:
+        polygons.extend(_extract_zone_polygons(getattr(zone, "polygon", None)))
+
+    if not polygons:
+        return None
+
+    return SimpleNamespace(polygon={"polygons": polygons})
 
 
 class ReconstructionService:
@@ -27,6 +58,8 @@ class ReconstructionService:
         overlay_lines: list[str] | None = None,
         analysis_job_id: int | None = None,
         draw_tracking: bool = False,
+        draw_facial_expression: bool = False,
+        facial_expression_zone_id: int | None = None,
     ) -> None:
         if job_id in self._tasks:
             return
@@ -36,6 +69,8 @@ class ReconstructionService:
                 overlay_lines=overlay_lines or [],
                 analysis_job_id=analysis_job_id,
                 draw_tracking=draw_tracking,
+                draw_facial_expression=draw_facial_expression,
+                facial_expression_zone_id=facial_expression_zone_id,
             )
         )
         self._tasks[job_id] = task
@@ -46,6 +81,8 @@ class ReconstructionService:
         overlay_lines: list[str],
         analysis_job_id: int | None,
         draw_tracking: bool,
+        draw_facial_expression: bool,
+        facial_expression_zone_id: int | None,
     ) -> None:
         sanitized_overlay_lines = _sanitize_overlay_lines(overlay_lines)
         async with self._session_factory() as session:
@@ -55,6 +92,8 @@ class ReconstructionService:
             await crud.update_reconstruction_job(session, job, ReconstructionStatus.running)
 
             tracking_by_frame_id: dict[int, list[dict]] = {}
+            facial_expression_service: FacialExpressionRecognitionService | None = None
+            facial_expression_zone: Any | None = None
             segments = []
             frames = await crud.get_frames_for_range(session, job.camera_id, job.start_time, job.end_time)
             frames = [frame for frame in frames if Path(frame.path).exists()]
@@ -108,17 +147,64 @@ class ReconstructionService:
                 )
                 return
 
+            if draw_facial_expression:
+                if not frames:
+                    await crud.update_reconstruction_job(
+                        session,
+                        job,
+                        ReconstructionStatus.failed,
+                        error="Facial expression overlay requested but no frames were found",
+                    )
+                    return
+
+                if facial_expression_zone_id is not None:
+                    facial_expression_zone = await crud.get_zone(session, facial_expression_zone_id)
+                    if (
+                        facial_expression_zone is None
+                        or int(getattr(facial_expression_zone, "camera_id", 0)) != int(job.camera_id)
+                    ):
+                        await crud.update_reconstruction_job(
+                            session,
+                            job,
+                            ReconstructionStatus.failed,
+                            error=f"Facial expression zone {facial_expression_zone_id} was not found for this camera",
+                        )
+                        return
+                else:
+                    camera_zones = await crud.list_zones(session, camera_id=job.camera_id)
+                    facial_expression_zone = _zone_filter_from_zones(camera_zones)
+                    if facial_expression_zone is None:
+                        await crud.update_reconstruction_job(
+                            session,
+                            job,
+                            ReconstructionStatus.failed,
+                            error="Facial expression overlay requires at least one configured zone",
+                        )
+                        return
+
+                facial_expression_service = FacialExpressionRecognitionService()
+                if not facial_expression_service.is_available():
+                    await crud.update_reconstruction_job(
+                        session,
+                        job,
+                        ReconstructionStatus.failed,
+                        error=facial_expression_service.error_message(),
+                    )
+                    return
+
         output_path = Path(settings.reconstructions_dir) / f"reconstruction_{job_id}.mp4"
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            if draw_tracking:
+            if draw_tracking or draw_facial_expression:
                 await asyncio.to_thread(
                     _concat_frames_with_overlay,
                     frames=[(frame.path, frame.timestamp, frame.id) for frame in frames],
                     output=str(output_path),
                     overlay_lines=sanitized_overlay_lines,
                     frame_detections=tracking_by_frame_id,
+                    facial_expression_service=facial_expression_service,
+                    facial_expression_zone=facial_expression_zone,
                 )
             elif segments:
                 if sanitized_overlay_lines:
@@ -334,6 +420,8 @@ def _concat_frames_with_overlay(
     output: str,
     overlay_lines: list[str],
     frame_detections: dict[int, list[dict]] | None = None,
+    facial_expression_service: FacialExpressionRecognitionService | None = None,
+    facial_expression_zone: Any | None = None,
 ) -> None:
     if not frames:
         raise RuntimeError("No frames available to reconstruct")
@@ -365,6 +453,15 @@ def _concat_frames_with_overlay(
                     trail_last_seen=track_last_seen,
                     frame_index=idx,
                 )
+
+            if facial_expression_service is not None and facial_expression_service.is_available():
+                facial_detections = facial_expression_service.detect_faces_with_demographics(
+                    image,
+                    zone=facial_expression_zone,
+                )
+                _draw_facial_expression_boxes(cv2, image, facial_detections)
+                _draw_zone_polygons_on_frame(cv2, image, facial_expression_zone)
+
             _draw_overlay_box(cv2, image, overlay_lines)
             rendered_path = tmp_path / f"overlay_{idx:06d}.jpg"
             if not cv2.imwrite(str(rendered_path), image):
@@ -626,19 +723,61 @@ def _draw_tracking_boxes(
         x2 = int(item["x2"])
         y2 = int(item["y2"])
         track_id = int(item["track_id"])
-        confidence = float(item["confidence"])
-        zone_id = item["zone_id"]
+        _confidence = float(item["confidence"])
+        _zone_id = item["zone_id"]
 
         color = _track_color(track_id)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-        zone_text = f" Z{zone_id}" if zone_id is not None else ""
-        label = f"ID {track_id} {confidence:.2f}{zone_text}"
+        label = f"ID {track_id}"
         (label_w, label_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
         label_top = max(0, y1 - label_h - baseline - 6)
         label_bottom = min(frame_height - 1, label_top + label_h + baseline + 6)
         label_right = min(frame_width - 1, x1 + label_w + 8)
 
+        cv2.rectangle(frame, (x1, label_top), (label_right, label_bottom), color, -1)
+        cv2.putText(
+            frame,
+            label,
+            (x1 + 4, label_bottom - baseline - 3),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+
+def _draw_facial_expression_boxes(cv2: Any, frame: Any, detections: list[dict[str, Any]]) -> None:
+    if not detections:
+        return
+
+    frame_height, frame_width = frame.shape[:2]
+    for row in detections:
+        try:
+            x1 = int(round(float(row.get("x1", 0))))
+            y1 = int(round(float(row.get("y1", 0))))
+            x2 = int(round(float(row.get("x2", 0))))
+            y2 = int(round(float(row.get("y2", 0))))
+            emotion = str(row.get("emotion", "")).strip() or "Unknown"
+        except Exception:  # noqa: BLE001
+            continue
+
+        x1 = max(0, min(frame_width - 1, x1))
+        y1 = max(0, min(frame_height - 1, y1))
+        x2 = max(0, min(frame_width - 1, x2))
+        y2 = max(0, min(frame_height - 1, y2))
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        color = (38, 180, 92)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+        label = f"{emotion}"
+        (label_w, label_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        label_top = max(0, y1 - label_h - baseline - 6)
+        label_bottom = min(frame_height - 1, label_top + label_h + baseline + 6)
+        label_right = min(frame_width - 1, x1 + label_w + 8)
         cv2.rectangle(frame, (x1, label_top), (label_right, label_bottom), color, -1)
         cv2.putText(
             frame,
@@ -674,3 +813,38 @@ def _estimate_fps(frames: list[tuple[str, datetime]]) -> float:
     avg_delta = sum(deltas) / len(deltas) if deltas else 1.0
     fps = 1.0 / max(avg_delta, 0.1)
     return min(30.0, max(1.0, fps))
+
+
+def _draw_zone_polygons_on_frame(cv2: Any, frame: Any, zone: Any) -> None:
+    """Draw zone polygon boundary/boundaries onto a video frame for facial expression mode."""
+    if zone is None:
+        return
+    try:
+        from app.services.zone_geometry import region_points_from_polygon
+        import numpy as np
+
+        frame_h, frame_w = frame.shape[:2]
+        if frame_w <= 0 or frame_h <= 0:
+            return
+
+        polygons = region_points_from_polygon(
+            getattr(zone, "polygon", None),
+            frame_w,
+            frame_h,
+            use_default_on_invalid=False,
+        )
+        if not polygons:
+            return
+
+        thickness = max(2, int(round(min(frame_w, frame_h) / 540)))
+        for poly in polygons:
+            pts = np.array(poly, dtype=np.int32).reshape((-1, 1, 2))
+            # Semi-transparent teal fill
+            overlay = frame.copy()
+            cv2.fillPoly(overlay, [pts], (166, 184, 20))
+            cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
+            # Solid teal zone boundary
+            cv2.polylines(frame, [pts], isClosed=True, color=(166, 184, 20), thickness=thickness, lineType=cv2.LINE_AA)
+
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Zone polygon draw on frame failed: %s", exc)

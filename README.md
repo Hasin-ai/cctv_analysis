@@ -95,7 +95,7 @@ Main environment variables:
 - `GET /api/monitoring/cameras/{camera_id}/frame`
 - `GET /api/monitoring/cameras/{camera_id}/stream.mjpg`
 - `GET /api/analyzer/status`, `GET /api/analyzer/cameras`, `GET /api/analyzer/zones/{camera_id}`
-- `POST /api/analyzer/run`, `POST /api/analyzer/total-person-detection`
+- `POST /api/analyzer/run`, `POST /api/analyzer/total-person-detection`, `POST /api/analyzer/facial-expression-recognition`
 - `GET /api/analyzer/jobs`, `GET /api/analyzer/jobs/{job_id}`, `GET /api/analyzer/stats/{job_id}`, `GET /api/analyzer/tracks/{job_id}`
 - `POST /api/reconstructions`, `GET /api/reconstructions`, `GET /api/reconstructions/{id}`, `GET /api/reconstructions/{id}/download`
 

@@ -30,6 +30,8 @@ async def create_reconstruction(
         overlay_lines=payload.overlay_lines,
         analysis_job_id=payload.analysis_job_id,
         draw_tracking=payload.draw_tracking,
+        draw_facial_expression=payload.draw_facial_expression,
+        facial_expression_zone_id=payload.facial_expression_zone_id,
     )
     return job
 

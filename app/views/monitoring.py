@@ -66,6 +66,15 @@ async def source_camera_frame(
     return await monitoring_controller.source_frame(session, camera_id)
 
 
+@router.get("/cameras/{camera_id}/facial-expression/realtime")
+async def realtime_facial_expression(
+    camera_id: int,
+    zone_id: int | None = Query(default=None),
+    session: AsyncSession = Depends(get_session),
+):
+    return await monitoring_controller.facial_expression_realtime(session, camera_id, zone_id)
+
+
 @router.get("/cameras/{camera_id}/stream.mjpg")
 async def camera_mjpeg_stream(
     camera_id: int,

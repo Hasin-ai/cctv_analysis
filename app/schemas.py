@@ -180,6 +180,8 @@ class ReconstructionCreate(BaseModel):
     overlay_lines: list[str] = Field(default_factory=list, max_length=8)
     analysis_job_id: int | None = None
     draw_tracking: bool = False
+    draw_facial_expression: bool = False
+    facial_expression_zone_id: int | None = None
 
 
 class ReconstructionRead(BaseModel):

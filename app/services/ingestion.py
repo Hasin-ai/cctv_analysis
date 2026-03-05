@@ -4,6 +4,7 @@ import asyncio
 import logging
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -165,25 +166,33 @@ def _run_ingestion(
         except OSError:
             logger.warning("Failed to remove stale frame file: %s", stale_path)
 
-    run_prefix = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
-    output_pattern = str(base_dir / f"{run_prefix}_%06d.jpg")
     fps_value = max(0.1, 1.0 / max(settings.frame_interval_seconds, 1e-6))
-    try:
-        cmd = _build_ffmpeg_command(source_kind, source_value, fps_value, output_pattern)
-    except ValueError as exc:
-        queue.put(
-            IngestionEvent(
-                kind="status",
-                camera_id=camera_id,
-                stream_id=stream_id,
-                status=FrameStatus.error,
-                message=str(exc),
-            )
-        )
-        return
-
-    seen: set[str] = set()
+    scan_sleep_seconds = max(
+        0.005,
+        min(
+            0.25,
+            float(settings.segment_scan_seconds),
+            max(float(settings.frame_interval_seconds), 0.005),
+        ),
+    )
     while not stop_event.is_set():
+        run_prefix = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+        output_pattern = str(base_dir / f"{run_prefix}_%06d.jpg")
+        next_frame_index = 0
+        try:
+            cmd = _build_ffmpeg_command(source_kind, source_value, fps_value, output_pattern)
+        except ValueError as exc:
+            queue.put(
+                IngestionEvent(
+                    kind="status",
+                    camera_id=camera_id,
+                    stream_id=stream_id,
+                    status=FrameStatus.error,
+                    message=str(exc),
+                )
+            )
+            return
+
         try:
             process = subprocess.Popen(
                 cmd,
@@ -208,9 +217,11 @@ def _run_ingestion(
             if process.poll() is not None:
                 break
 
-            for path in sorted(base_dir.glob(f"{run_prefix}_*.jpg")):
-                if path.name in seen:
-                    continue
+            emitted_any = False
+            while True:
+                path = base_dir / f"{run_prefix}_{next_frame_index:06d}.jpg"
+                if not path.exists():
+                    break
                 stat = path.stat()
                 timestamp = datetime.utcfromtimestamp(stat.st_mtime)
                 size_bytes = stat.st_size
@@ -227,9 +238,11 @@ def _run_ingestion(
                         status=FrameStatus.captured,
                     )
                 )
-                seen.add(path.name)
+                next_frame_index += 1
+                emitted_any = True
 
-            time.sleep(settings.segment_scan_seconds)
+            if not emitted_any:
+                time.sleep(scan_sleep_seconds)
 
         if stop_event.is_set():
             _terminate_process(process)
@@ -271,6 +284,16 @@ def _build_ffmpeg_command(
         )
     elif source_kind == "file":
         cmd.extend(["-stream_loop", "-1", "-re", "-i", source_value])
+    elif source_kind == "webcam":
+        if sys.platform == "darwin":
+            cmd.extend(["-f", "avfoundation", "-framerate", "30", "-i", source_value])
+        elif sys.platform.startswith("linux"):
+            cmd.extend(["-f", "v4l2", "-framerate", "30", "-i", f"/dev/video{source_value}"])
+        elif sys.platform == "win32":
+            cmd.extend(["-f", "dshow", "-i", f"video={source_value}"])
+        else:
+            # Fallback for unknown OS
+            cmd.extend(["-i", source_value])
     else:
         raise ValueError(f"Unsupported ingestion source kind: {source_kind}")
 

@@ -194,10 +194,12 @@ def _resolve_capture_source(source_url: str) -> tuple[str, str]:
         return "rtsp", resolve_rtsp_url(source_url)
     if scheme == "file":
         return "file", _file_path_from_uri(source_url)
+    if scheme == "webcam":
+        return "webcam", str(parsed.netloc or "0")
 
     raise HTTPException(
         status_code=400,
-        detail="Unsupported camera source URL. Use rtsp://, rtsps://, or file://",
+        detail="Unsupported camera source URL. Use rtsp://, rtsps://, file://, or webcam://",
     )
 
 

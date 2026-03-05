@@ -38,21 +38,15 @@ class FacialExpressionRecognitionService:
         self._init_error: str | None = None
         self._cv2 = None
         self._deepface = None
-        self._face_cascade = None
         self._emotion_labels = list(DEEPFACE_EMOTION_LABELS)
-        self._analysis_actions = ["emotion", "age", "gender"]
 
         try:
             import cv2  # type: ignore
             from deepface import DeepFace  # type: ignore
 
+            # Warm the model on first import to catch missing weights early
             self._cv2 = cv2
             self._deepface = DeepFace
-            cascade_dir = getattr(getattr(cv2, "data", None), "haarcascades", "")
-            if cascade_dir:
-                cascade = cv2.CascadeClassifier(f"{cascade_dir}haarcascade_frontalface_default.xml")
-                if cascade is not None and not cascade.empty():
-                    self._face_cascade = cascade
             self._available = True
         except Exception as exc:  # noqa: BLE001
             self._init_error = str(exc)
@@ -63,240 +57,6 @@ class FacialExpressionRecognitionService:
 
     def error_message(self) -> str:
         return self._init_error or "DeepFace service is unavailable"
-
-    def _resolve_detector_backend(self) -> str:
-        detector = str(getattr(settings, "facial_expression_detector_backend", "opencv") or "opencv").strip().lower()
-        # "skip" only works when DeepFace receives a cropped face; our full-frame
-        # fallback must use a real detector backend.
-        if detector == "skip":
-            return "opencv"
-        return detector
-
-    def _resize_for_detection(
-        self,
-        image: Any,
-        *,
-        max_side: int = 960,
-    ) -> tuple[Any, float]:
-        frame_h, frame_w = image.shape[:2]
-        longest_side = max(frame_w, frame_h)
-        if longest_side <= max_side:
-            return image, 1.0
-
-        scale = max_side / float(longest_side)
-        resized = self._cv2.resize(
-            image,
-            (max(1, int(round(frame_w * scale))), max(1, int(round(frame_h * scale)))),
-            interpolation=self._cv2.INTER_AREA,
-        )
-        return resized, scale
-
-    def _extract_face_attributes(self, face: Any) -> dict[str, Any] | None:
-        if not isinstance(face, dict):
-            return None
-
-        dominant_gender = face.get("dominant_gender")
-        gender_confidence = None
-        if dominant_gender and isinstance(face.get("gender"), dict):
-            gender_confidence = face["gender"].get(dominant_gender)
-
-        face_confidence_raw = face.get("face_confidence", face.get("confidence"))
-        if face_confidence_raw is None:
-            face_confidence = 1.0
-        else:
-            try:
-                face_confidence = float(face_confidence_raw)
-            except (TypeError, ValueError):
-                face_confidence = 0.0
-            if face_confidence != face_confidence:  # NaN guard
-                face_confidence = 0.0
-
-        return {
-            "emotion": face.get("dominant_emotion"),
-            "age": face.get("age"),
-            "gender": dominant_gender,
-            "gender_confidence": gender_confidence,
-            "face_confidence": face_confidence,
-        }
-
-    def _build_detection_row(
-        self,
-        x1: int,
-        y1: int,
-        x2: int,
-        y2: int,
-        attributes: dict[str, Any],
-        *,
-        min_face_confidence: float,
-    ) -> dict[str, Any] | None:
-        if x2 <= x1 or y2 <= y1:
-            return None
-
-        face_confidence = float(attributes.get("face_confidence", 0.0))
-        if face_confidence < min_face_confidence:
-            return None
-
-        return {
-            "x1": int(x1),
-            "y1": int(y1),
-            "x2": int(x2),
-            "y2": int(y2),
-            "emotion": attributes.get("emotion"),
-            "age": attributes.get("age"),
-            "gender": attributes.get("gender"),
-            "gender_confidence": attributes.get("gender_confidence"),
-            "face_confidence": round(face_confidence, 4),
-        }
-
-    def _expand_box(
-        self,
-        x1: int,
-        y1: int,
-        x2: int,
-        y2: int,
-        frame_width: int,
-        frame_height: int,
-        *,
-        margin_ratio: float = 0.18,
-    ) -> tuple[int, int, int, int]:
-        margin_x = int(round((x2 - x1) * margin_ratio))
-        margin_y = int(round((y2 - y1) * margin_ratio))
-        return (
-            max(0, x1 - margin_x),
-            max(0, y1 - margin_y),
-            min(frame_width, x2 + margin_x),
-            min(frame_height, y2 + margin_y),
-        )
-
-    def _detect_candidate_face_boxes(self, image: Any) -> list[tuple[int, int, int, int]]:
-        if self._face_cascade is None or image is None:
-            return []
-
-        frame_h, frame_w = image.shape[:2]
-        if frame_h <= 0 or frame_w <= 0:
-            return []
-
-        resized, scale = self._resize_for_detection(image)
-        gray = self._cv2.cvtColor(resized, self._cv2.COLOR_BGR2GRAY)
-        gray = self._cv2.equalizeHist(gray)
-
-        min_face_size = max(12, int(getattr(settings, "facial_expression_min_face_size", 15)))
-        scaled_min_face_size = max(8, int(round(min_face_size * scale)))
-        scale_factor = max(1.01, float(getattr(settings, "facial_expression_face_scale_factor", 1.1)))
-        min_neighbors = max(1, int(getattr(settings, "facial_expression_face_min_neighbors", 3)))
-
-        faces = self._face_cascade.detectMultiScale(
-            gray,
-            scaleFactor=scale_factor,
-            minNeighbors=min_neighbors,
-            minSize=(scaled_min_face_size, scaled_min_face_size),
-        )
-
-        if len(faces) == 0:
-            return []
-
-        inv_scale = 1.0 / scale
-        boxes: list[tuple[int, int, int, int]] = []
-        for x, y, w, h in faces:
-            x1 = max(0, min(frame_w - 1, int(round(x * inv_scale))))
-            y1 = max(0, min(frame_h - 1, int(round(y * inv_scale))))
-            x2 = max(0, min(frame_w, int(round((x + w) * inv_scale))))
-            y2 = max(0, min(frame_h, int(round((y + h) * inv_scale))))
-            if x2 <= x1 or y2 <= y1:
-                continue
-            boxes.append((x1, y1, x2, y2))
-        return boxes
-
-    def _analyze_face_crop(self, face_crop: Any) -> dict[str, Any] | None:
-        try:
-            results = self._deepface.analyze(
-                img_path=face_crop,
-                actions=self._analysis_actions,
-                enforce_detection=False,
-                detector_backend="skip",
-                silent=True,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("DeepFace crop analysis failed: %s", exc)
-            return None
-
-        if not isinstance(results, list):
-            results = [results]
-
-        for face in results:
-            attributes = self._extract_face_attributes(face)
-            if attributes is not None:
-                return attributes
-        return None
-
-    def _detect_with_deepface_backend(
-        self,
-        analysis_image: Any,
-        *,
-        offset_x: int,
-        offset_y: int,
-        frame_width: int,
-        frame_height: int,
-        polygons: list[list[tuple[int, int]]],
-        min_face_confidence: float,
-    ) -> list[dict[str, Any]]:
-        detector = self._resolve_detector_backend()
-        resized_image, scale = self._resize_for_detection(analysis_image)
-        try:
-            results = self._deepface.analyze(
-                img_path=resized_image,
-                actions=self._analysis_actions,
-                enforce_detection=False,
-                detector_backend=detector,
-                silent=True,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("DeepFace.analyze failed with detector %s: %s", detector, exc)
-            return []
-
-        if not isinstance(results, list):
-            results = [results]
-
-        inv_scale = 1.0 / scale
-        detections: list[dict[str, Any]] = []
-        for face in results:
-            if not isinstance(face, dict):
-                continue
-            region = face.get("region", {})
-            try:
-                x = int(region.get("x", 0))
-                y = int(region.get("y", 0))
-                w = int(region.get("w", 0))
-                h = int(region.get("h", 0))
-            except Exception:  # noqa: BLE001
-                continue
-
-            if w <= 0 or h <= 0:
-                continue
-
-            attributes = self._extract_face_attributes(face)
-            if attributes is None:
-                continue
-
-            x1 = max(0, min(frame_width - 1, offset_x + int(round(x * inv_scale))))
-            y1 = max(0, min(frame_height - 1, offset_y + int(round(y * inv_scale))))
-            x2 = max(0, min(frame_width, offset_x + int(round((x + w) * inv_scale))))
-            y2 = max(0, min(frame_height, offset_y + int(round((y + h) * inv_scale))))
-            if polygons and not _face_in_any_polygon(float(x1), float(y1), float(x2), float(y2), polygons):
-                continue
-
-            row = self._build_detection_row(
-                x1,
-                y1,
-                x2,
-                y2,
-                attributes,
-                min_face_confidence=min_face_confidence,
-            )
-            if row is not None:
-                detections.append(row)
-
-        return detections
 
     def analyze_frames(
         self,
@@ -430,56 +190,77 @@ class FacialExpressionRecognitionService:
             offset_x = x1
             offset_y = y1
 
-        min_face_confidence = max(0.0, float(getattr(settings, "facial_expression_face_confidence_threshold", 0.01)))
+        try:
+            results = self._deepface.analyze(
+                img_path=analysis_image,
+                actions=["emotion", "age", "gender"],
+                enforce_detection=False,
+                silent=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("DeepFace.analyze failed: %s", exc)
+            return []
+
+        if not isinstance(results, list):
+            results = [results]
+
         detections: list[dict[str, Any]] = []
-        candidate_boxes = self._detect_candidate_face_boxes(analysis_image)
-        for local_x1, local_y1, local_x2, local_y2 in candidate_boxes:
-            crop_x1, crop_y1, crop_x2, crop_y2 = self._expand_box(
-                local_x1,
-                local_y1,
-                local_x2,
-                local_y2,
-                analysis_image.shape[1],
-                analysis_image.shape[0],
-            )
-            face_crop = analysis_image[crop_y1:crop_y2, crop_x1:crop_x2]
-            if face_crop is None or getattr(face_crop, "size", 0) == 0:
+        min_face_confidence = max(0.0, float(getattr(settings, "facial_expression_face_confidence_threshold", 0.01)))
+        for face in results:
+            try:
+                region = face.get("region", {})
+                x = int(region.get("x", 0))
+                y = int(region.get("y", 0))
+                w = int(region.get("w", 0))
+                h = int(region.get("h", 0))
+
+                if w <= 0 or h <= 0:
+                    continue
+
+                face_confidence_raw = face.get("face_confidence", face.get("confidence"))
+                if face_confidence_raw is None:
+                    face_confidence = 1.0
+                else:
+                    face_confidence = float(face_confidence_raw)
+                    if face_confidence != face_confidence:  # NaN guard
+                        face_confidence = 0.0
+                if face_confidence < min_face_confidence:
+                    continue
+
+                x1 = max(0, offset_x + x)
+                y1 = max(0, offset_y + y)
+                x2 = min(frame_w, offset_x + x + w)
+                y2 = min(frame_h, offset_y + y + h)
+
+                # Zone filtering
+                if polygons and not _face_in_any_polygon(
+                    float(x1), float(y1), float(x2), float(y2), polygons
+                ):
+                    continue
+
+                dominant_emotion = face.get("dominant_emotion")
+                age = face.get("age")
+                dominant_gender = face.get("dominant_gender")
+                gender_confidence = None
+                if dominant_gender and isinstance(face.get("gender"), dict):
+                    gender_confidence = face["gender"].get(dominant_gender)
+
+                detections.append({
+                    "x1": x1,
+                    "y1": y1,
+                    "x2": x2,
+                    "y2": y2,
+                    "emotion": dominant_emotion,
+                    "age": age,
+                    "gender": dominant_gender,
+                    "gender_confidence": gender_confidence,
+                    "face_confidence": round(float(face_confidence), 4),
+                })
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("DeepFace face result parse failed: %s", exc)
                 continue
 
-            attributes = self._analyze_face_crop(face_crop)
-            if attributes is None:
-                continue
-
-            x1 = offset_x + local_x1
-            y1 = offset_y + local_y1
-            x2 = offset_x + local_x2
-            y2 = offset_y + local_y2
-            if polygons and not _face_in_any_polygon(float(x1), float(y1), float(x2), float(y2), polygons):
-                continue
-
-            row = self._build_detection_row(
-                x1,
-                y1,
-                x2,
-                y2,
-                attributes,
-                min_face_confidence=min_face_confidence,
-            )
-            if row is not None:
-                detections.append(row)
-
-        if detections:
-            return detections
-
-        return self._detect_with_deepface_backend(
-            analysis_image,
-            offset_x=offset_x,
-            offset_y=offset_y,
-            frame_width=frame_w,
-            frame_height=frame_h,
-            polygons=polygons,
-            min_face_confidence=min_face_confidence,
-        )
+        return detections
 
     def filter_detections_by_zone(
         self,

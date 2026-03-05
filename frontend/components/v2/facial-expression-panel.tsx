@@ -6,7 +6,6 @@ import {
   type FacialExpressionRealtimeResponse,
   getFacialExpressionRealtime,
 } from "@/lib/api";
-import { isZoneFilterSelected, parseSelectedZoneId } from "@/lib/zone-selection";
 import { StatTile } from "@/components/v2/ui";
 
 const ANALYSIS_POLL_INTERVAL_MS = 1000;
@@ -18,7 +17,7 @@ function formatPercent(value: number | undefined): string {
 
 export function FacialExpressionPanel({
   cameraId,
-  selectedZoneId = "",
+  selectedZoneId = "all",
   start,
 }: {
   cameraId: number;
@@ -34,10 +33,11 @@ export function FacialExpressionPanel({
   const inFlightRef = useRef(false);
 
   const zoneId = useMemo(() => {
-    return parseSelectedZoneId(selectedZoneId);
+    if (selectedZoneId === "all") return null;
+    const parsed = Number(selectedZoneId);
+    if (!Number.isFinite(parsed) || parsed <= 0) return null;
+    return parsed;
   }, [selectedZoneId]);
-  const hasExplicitZone = useMemo(() => isZoneFilterSelected(selectedZoneId), [selectedZoneId]);
-  const scopeLabel = data?.zone_name ?? (hasExplicitZone ? "Selected zone" : "All configured zones");
 
   const runAnalysis = useCallback(async (requestId: number) => {
     if (inFlightRef.current) return;
@@ -115,12 +115,6 @@ export function FacialExpressionPanel({
       ) : null}
 
       {error ? <p className="text-sm text-destructive">{error}</p> : null}
-      {data && !data.detector_available ? (
-        <p className="text-sm text-destructive">Facial expression detector is unavailable on the backend.</p>
-      ) : null}
-      {data && !data.zone_filter_available ? (
-        <p className="text-sm text-muted-foreground">Configure at least one valid zone polygon to run facial analytics.</p>
-      ) : null}
 
       {!data && !loading && !error ? (
         <p className="text-sm text-muted-foreground">No facial expression data available yet.</p>
@@ -129,17 +123,13 @@ export function FacialExpressionPanel({
       {data ? (
         <>
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-            <StatTile
-              label="Faces Analyzed"
-              value={data.analyzed_faces}
-              hint={hasExplicitZone ? "Faces inside selected zone" : "Faces inside configured zones"}
-            />
-            <StatTile label="Dominant Emotion" value={data.dominant_emotion ?? "N/A"} hint={scopeLabel} />
+            <StatTile label="Faces Analyzed" value={data.analyzed_faces} hint="Faces inside selected zone" />
+            <StatTile label="Dominant Emotion" value={data.dominant_emotion ?? "N/A"} hint={data.zone_name ?? "Selected zone"} />
             <StatTile label="Avg. Age" value={data.avg_age ?? "N/A"} hint="Overall average age" />
             <StatTile
-              label="Analysis Scope"
-              value={scopeLabel}
-              hint={data.zone_filter_available ? "Current face-analysis scope" : "No valid zone polygons configured"}
+              label="Zone Filter"
+              value={data.zone_filter_available ? "Applied" : "Missing"}
+              hint={data.zone_name ?? "No zone selected"}
             />
           </div>
 
@@ -157,9 +147,7 @@ export function FacialExpressionPanel({
                   {emotionRows.length === 0 ? (
                     <tr>
                       <td className="px-3 py-3 text-muted-foreground" colSpan={3}>
-                        {data.zone_filter_available
-                          ? `No faces detected in ${scopeLabel.toLowerCase()}.`
-                          : "Facial analytics requires at least one valid zone polygon."}
+                        No faces detected in the selected zone.
                       </td>
                     </tr>
                   ) : (

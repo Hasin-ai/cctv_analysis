@@ -320,6 +320,52 @@ export type TotalPersonDetectionResponse = {
   series: TotalPersonFrameCount[];
 };
 
+export type FacialExpressionFrameResult = {
+  frame_id: number;
+  timestamp: string | null;
+  analyzed_faces: number;
+  dominant_emotion: string | null;
+  emotion_counts: Record<string, number>;
+  avg_age?: number | null;
+  dominant_gender?: string | null;
+};
+
+export type FacialExpressionRecognitionResponse = {
+  camera_id: number;
+  zone_id: number | null;
+  zone_name: string | null;
+  start_time: string;
+  end_time: string;
+  detector_available: boolean;
+  processed_frames: number;
+  analyzed_faces: number;
+  dominant_emotion: string | null;
+  emotion_counts: Record<string, number>;
+  emotion_percentages: Record<string, number>;
+  avg_age?: number | null;
+  gender_counts?: Record<string, number>;
+  age_distribution?: Record<string, number>;
+  series: FacialExpressionFrameResult[];
+};
+
+export type FacialExpressionRealtimeResponse = {
+  camera_id: number;
+  zone_id: number | null;
+  zone_name: string | null;
+  frame_id: number | null;
+  frame_timestamp: string | null;
+  detector_available: boolean;
+  zone_filter_available: boolean;
+  analyzed_faces: number;
+  dominant_emotion: string | null;
+  emotion_counts: Record<string, number>;
+  emotion_percentages: Record<string, number>;
+  avg_age?: number | null;
+  gender_counts?: Record<string, number>;
+  age_distribution?: Record<string, number>;
+};
+
+
 export type QueueStatus = {
   available: boolean;
   fetcher_enabled: boolean;
@@ -613,6 +659,26 @@ export async function runTotalPersonDetection(payload: {
   });
 }
 
+export async function runFacialExpressionRecognition(payload: {
+  camera_id: number;
+  zone_id?: number | null;
+  start: string;
+  end: string;
+}) {
+  return request<FacialExpressionRecognitionResponse>("/api/v1/analyzer/facial-expression-recognition", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getFacialExpressionRealtime(input: { cameraId: number; zoneId?: number | null }) {
+  return request<FacialExpressionRealtimeResponse>(
+    withQuery(`/api/monitoring/cameras/${input.cameraId}/facial-expression/realtime`, {
+      zone_id: input.zoneId,
+    }),
+  );
+}
+
 export async function getAnalyzerJob(jobId: number) {
   return request<AnalyzerJob>(`/api/v1/analyzer/jobs/${jobId}`);
 }
@@ -677,6 +743,8 @@ export async function createReconstruction(payload: {
   overlay_lines?: string[];
   analysis_job_id?: number | null;
   draw_tracking?: boolean;
+  draw_facial_expression?: boolean;
+  facial_expression_zone_id?: number | null;
 }) {
   return request<ReconstructionJob>("/api/reconstructions", {
     method: "POST",

@@ -28,7 +28,7 @@ export type SourceRow = {
   realtime: RealtimeCameraSnapshot | null;
   hasLiveFrame: boolean;
   status: SourceStatus;
-  type: "RTSP" | "Video File";
+  type: "RTSP" | "Video File" | "Webcam";
   endpoint: string;
   resolution: string;
   fps: number;
@@ -38,8 +38,9 @@ export type SourceRow = {
 export type SaveSourceInput = {
   cameraId?: number;
   name: string;
-  sourceType: "rtsp" | "file";
+  sourceType: "rtsp" | "file" | "webcam";
   rtspUrl: string;
+  webcamId?: string;
   file?: File | null;
   fileName: string;
   scheduleLabel: string;
@@ -83,9 +84,12 @@ function formatUptime(startedAt: string | null | undefined, status: SourceStatus
   return `${minutes}m`;
 }
 
-function sourceEndpoint(camera: Camera, sourceType: "RTSP" | "Video File"): string {
+function sourceEndpoint(camera: Camera, sourceType: "RTSP" | "Video File" | "Webcam"): string {
   if (sourceType === "RTSP") {
     return camera.rtsp_url || "-";
+  }
+  if (sourceType === "Webcam") {
+    return camera.rtsp_url ? camera.rtsp_url.replace("webcam://", "Device: ") : "Unknown Device";
   }
   const location = camera.location?.trim() || "";
   const fileFromLocation = location.includes("File:")
@@ -111,8 +115,9 @@ function sourceEndpoint(camera: Camera, sourceType: "RTSP" | "Video File"): stri
   return "Uploaded video";
 }
 
-function sourceTypeForCamera(camera: Camera): "RTSP" | "Video File" {
+function sourceTypeForCamera(camera: Camera): "RTSP" | "Video File" | "Webcam" {
   const source = (camera.rtsp_url || "").trim().toLowerCase();
+  if (source.startsWith("webcam://")) return "Webcam";
   if (source.startsWith("rtsp://") || source.startsWith("rtsps://")) return "RTSP";
   if (source.startsWith("file://")) return "Video File";
   return source ? "RTSP" : "Video File";
@@ -234,15 +239,17 @@ export function useSourcesData(options: Options = {}) {
       .map((camera) => {
         const stream = streamByCamera.get(camera.id) ?? null;
         const snapshot = realtimeByCamera.get(camera.id) ?? null;
-        const streamStatus = stream?.status ?? snapshot?.stream_status;
+        const streamStatus = snapshot?.stream_status ?? stream?.status;
         const type = sourceTypeForCamera(camera);
-        const status = statusFromStream(streamStatus, Boolean(camera.rtsp_url?.trim()));
+        const hasLiveFrame = Boolean(snapshot?.has_live_frame);
+        const inferredStatus = statusFromStream(streamStatus, Boolean(camera.rtsp_url?.trim()));
+        const status: SourceStatus = hasLiveFrame ? "live" : inferredStatus;
 
         return {
           camera,
           stream,
           realtime: snapshot,
-          hasLiveFrame: Boolean(snapshot?.has_live_frame),
+          hasLiveFrame,
           status,
           type,
           endpoint: sourceEndpoint(camera, type),
@@ -350,6 +357,23 @@ export function useSourcesData(options: Options = {}) {
             setNotice(`Updated source #${camera.id}`);
           } else {
             throw new Error("Select a video file to upload");
+          }
+        } else if (input.sourceType === "webcam") {
+          const deviceUrl = `webcam://${input.webcamId?.trim() || "0"}`;
+          if (input.cameraId) {
+            camera = await updateCamera(input.cameraId, {
+              name,
+              rtsp_url: deviceUrl,
+              location,
+            });
+            setNotice(`Updated source #${camera.id}`);
+          } else {
+            camera = await createCamera({
+              name,
+              rtsp_url: deviceUrl,
+              location,
+            });
+            setNotice(`Created source #${camera.id}`);
           }
         } else {
           const trimmedRtspUrl = input.rtspUrl.trim();

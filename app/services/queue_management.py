@@ -11,6 +11,7 @@ import time
 from app.core.config import settings
 from app.db import crud
 from app.db.models import QueueJobStatus
+from app.services.yolo_threadsafe import build_locked_callable
 from app.services.yolo_person_classes import resolve_person_class_ids
 from app.services.zone_geometry import region_points_from_polygon
 
@@ -137,6 +138,7 @@ class QueueManagementService:
         self._cv2 = None
         self._np = None
         self._yolo = None
+        self._track = None
         self._person_class_ids: list[int] = [0]
 
         if not self._use_yolo:
@@ -156,6 +158,7 @@ class QueueManagementService:
             import numpy as np  # type: ignore
 
             self._yolo = YOLO(str(model_path))
+            self._track = build_locked_callable(self._yolo.track)
             self._cv2 = cv2
             self._np = np
             self._person_class_ids = resolve_person_class_ids(self._yolo)
@@ -165,7 +168,13 @@ class QueueManagementService:
 
     def is_available(self) -> bool:
         """Check if queue detector dependencies are available."""
-        return self._use_yolo and self._yolo is not None and self._cv2 is not None and self._np is not None
+        return (
+            self._use_yolo
+            and self._yolo is not None
+            and self._track is not None
+            and self._cv2 is not None
+            and self._np is not None
+        )
 
     async def run_queue_analysis(
         self,
@@ -325,7 +334,7 @@ class QueueManagementService:
                 
             # Use ByteTrack for object IDs
             predict_kwargs["tracker"] = "bytetrack.yaml"
-            results = self._yolo.track(image, persist=True, **predict_kwargs)
+            results = self._track(image, persist=True, **predict_kwargs)
             boxes = results[0].boxes if results and results[0].boxes is not None else None
             
             if boxes is None or boxes.id is None:

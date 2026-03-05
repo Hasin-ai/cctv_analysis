@@ -22,7 +22,10 @@ if _IS_SQLITE:
     def _set_sqlite_pragmas(dbapi_connection, connection_record) -> None:  # type: ignore[no-untyped-def]
         cursor = dbapi_connection.cursor()
         # Improve concurrent read/write behavior for API + ingestion workers.
-        cursor.execute("PRAGMA journal_mode=WAL")
+        journal_mode = (getattr(settings, "sqlite_journal_mode", "DELETE") or "DELETE").strip().upper()
+        if journal_mode not in {"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}:
+            journal_mode = "DELETE"
+        cursor.execute(f"PRAGMA journal_mode={journal_mode}")
         cursor.execute("PRAGMA synchronous=NORMAL")
         cursor.execute("PRAGMA busy_timeout=30000")
         cursor.execute("PRAGMA foreign_keys=ON")

@@ -263,6 +263,14 @@ class TrajectoryHeatmapService:
         segments_added = 0
         active_tracks = 0
 
+        if not zone_boxes:
+            state.heatmap.fill(0.0)
+            state.prev_point_by_track = {}
+            state.active_tracks = 0
+            state.last_frame_token = frame_token
+            state.updated_at_monotonic = now
+            return
+
         for row in tracked:
             try:
                 if len(row) < 5:
@@ -280,12 +288,9 @@ class TrajectoryHeatmapService:
 
             px = max(0.0, min(float(state.frame_width - 1), (x1 + x2) / 2.0))
             py = max(0.0, min(float(state.frame_height - 1), y2))
-            if zone_boxes:
-                box_index = _point_in_any_box(px, py, zone_boxes)
-                if box_index < 0:
-                    continue
-            else:
-                box_index = 0
+            box_index = _point_in_any_box(px, py, zone_boxes)
+            if box_index < 0:
+                continue
 
             active_tracks += 1
             current_point = (px, py, box_index)

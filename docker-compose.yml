@@ -9,9 +9,15 @@ services:
     environment:
       SERVICE_ROLE: "fetcher"
       DATABASE_URL: "sqlite+aiosqlite:///./data/app.db"
+      SQLITE_JOURNAL_MODE: "DELETE"
       RTSP_INTERNAL_HOST: "host.docker.internal"
       ANALYTICS_USE_YOLO: "true"
-      FRAME_INTERVAL_SECONDS: "0.3333333333"
+      FRAME_INTERVAL_SECONDS: "0.04"
+      MJPEG_JPEG_QUALITY: "80"
+      SEGMENT_SCAN_SECONDS: "0.04"
+      FACIAL_EXPRESSION_FACE_CONFIDENCE_THRESHOLD: "0.01"
+      FACIAL_EXPRESSION_REALTIME_INTERVAL_SECONDS: "0.04"
+      FACIAL_EXPRESSION_REALTIME_CACHE_TTL_SECONDS: "0.4"
       YOLO_MODEL_PATH: "/app/data/models/best.pt"
       YOLO_CONFIDENCE: "0.3"
       BOXMOT_REID_WEIGHTS: "/app/data/models/osnet_x0_25_msmt17.pt"
@@ -20,8 +26,15 @@ services:
       PERSONVIT_SIMILARITY_THRESHOLD: "0.6"
     volumes:
       - ./data:/app/data
+      - ~/.deepface:/root/.deepface
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)",
+        ]
       interval: 15s
       timeout: 5s
       retries: 5
