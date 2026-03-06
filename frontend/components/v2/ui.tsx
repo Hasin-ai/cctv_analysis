@@ -1,16 +1,25 @@
 "use client";
 
-import { type ReactNode, useEffect, useMemo, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
 import type { RealtimeDetectionBox, Zone } from "@/lib/api";
+import { isZoneFilterSelected } from "@/lib/zone-selection";
 import { cn } from "@/lib/utils";
 import type { SourceStatus } from "@/hooks/use-sources-data";
 
 
-export type AnalyticsMode = "person_count" | "queue" | "entry_exit_count" | "person_reid";
+export type AnalyticsMode =
+  | "person_count"
+  | "queue"
+  | "entry_exit_count"
+  | "person_reid"
+  | "facial_expression"
+  | "trajectory_heatmap";
 
 export const ANALYTICS_MODES: Array<{ id: AnalyticsMode; label: string }> = [
   { id: "person_count", label: "Person Count" },
+  { id: "trajectory_heatmap", label: "Trajectory Heatmap" },
+  { id: "facial_expression", label: "Facial Expression" },
   { id: "queue", label: "Queue Management" },
   { id: "entry_exit_count", label: "Entry/Exit Count" },
   { id: "person_reid", label: "Person ReID" },
@@ -177,19 +186,21 @@ export function CameraFeed({
   analyticsMode?: AnalyticsMode;
 }) {
   const [streamErrored, setStreamErrored] = useState(false);
-  const [snapshotErrored, setSnapshotErrored] = useState(false);
+  const [streamReady, setStreamReady] = useState(false);
   const [snapshotTick, setSnapshotTick] = useState(0);
   const [streamNonce, setStreamNonce] = useState(0);
 
   const analyticsModeParam = analyticsMode ?? "person_count";
+  const hasZoneFilter = isZoneFilterSelected(zoneId);
+  const filteredZoneId = hasZoneFilter ? zoneId ?? "" : "";
 
-  const streamUrlBase = `/api/backend/api/monitoring/cameras/${cameraId}/stream.mjpg`;
+  const streamUrlBase = `/api/stream/cameras/${cameraId}/stream.mjpg`;
   const streamParams = new URLSearchParams({
     v: String(streamNonce),
     analytics_mode: analyticsModeParam,
   });
-  if (zoneId && zoneId !== "all") {
-    streamParams.set("zone_id", zoneId);
+  if (hasZoneFilter) {
+    streamParams.set("zone_id", filteredZoneId);
   }
   const streamUrl = `${streamUrlBase}?${streamParams.toString()}`;
 
@@ -202,15 +213,15 @@ export function CameraFeed({
   if (!staticFirstFrame) {
     snapshotParams.set("t", String(snapshotTick));
   }
-  if (zoneId && zoneId !== "all") {
-    snapshotParams.set("zone_id", zoneId);
+  if (hasZoneFilter) {
+    snapshotParams.set("zone_id", filteredZoneId);
   }
   const snapshotUrl = `${snapshotUrlBase}?${snapshotParams.toString()}`;
   const parsedZones = useMemo(
     () => {
       let filteredZones = zones;
-      if (zoneId && zoneId !== "all") {
-        filteredZones = zones.filter((z) => z.id.toString() === zoneId);
+      if (hasZoneFilter) {
+        filteredZones = zones.filter((z) => z.id.toString() === filteredZoneId);
       }
       const results = filteredZones.map((zone) => {
         const polygons = readZonePolygons(zone);
@@ -226,7 +237,7 @@ export function CameraFeed({
       });
       return results.filter((zone): zone is NonNullable<typeof results[number]> => zone !== null);
     },
-    [zones, zoneId],
+    [filteredZoneId, hasZoneFilter, zones],
   );
   const parsedDetectionBoxes = useMemo(
     () =>
@@ -270,30 +281,65 @@ export function CameraFeed({
     [detectionBoxes],
   );
 
-  const showStream = !staticFirstFrame && status === "live" && hasLiveFrame && !streamErrored;
-  const showSnapshot = !showStream && !snapshotErrored;
+  const streamLoadedRef = useRef(false);
+  const statusRef = useRef(status);
+  statusRef.current = status;
+
+  const canUseLiveStream = status === "live" || hasLiveFrame || streamLoadedRef.current;
+  const showStream = !staticFirstFrame && canUseLiveStream && !streamErrored;
+  // Keep a still frame visible until the MJPEG stream has actually delivered
+  // its first frame, otherwise the panel goes blank during connect/reconnect.
+  const showSnapshot = staticFirstFrame || !showStream || !streamReady;
+  const showFallbackBackground = false;
+  const showFrontendPersonBoxes =
+    analyticsModeParam !== "entry_exit_count" &&
+    analyticsModeParam !== "facial_expression" &&
+    analyticsModeParam !== "trajectory_heatmap" &&
+    analyticsModeParam !== "person_reid";
+  const showFrontendZones =
+    analyticsModeParam !== "facial_expression" &&
+    analyticsModeParam !== "trajectory_heatmap" &&
+    analyticsModeParam !== "person_reid";
+  const mediaObjectClass = analyticsModeParam === "facial_expression" ? "object-cover" : "object-fill";
+  const shouldRefreshSnapshot =
+    showSnapshot &&
+    !staticFirstFrame &&
+    (status === "live" || hasLiveFrame || streamLoadedRef.current);
 
   useEffect(() => {
     setStreamErrored(false);
-    setSnapshotErrored(false);
-  }, [analyticsModeParam, cameraId, status, hasLiveFrame, staticFirstFrame]);
+    setStreamReady(false);
+    streamLoadedRef.current = false;
+  }, [analyticsModeParam, cameraId, staticFirstFrame]);
 
   useEffect(() => {
     setSnapshotTick(0);
     setStreamNonce((value) => value + 1);
+    setStreamReady(false);
+    streamLoadedRef.current = false;
   }, [analyticsModeParam, cameraId, staticFirstFrame, zoneId]);
 
   useEffect(() => {
-    if (showStream || staticFirstFrame) return undefined;
+    if (!shouldRefreshSnapshot) return undefined;
+    // Use a longer interval to avoid overlapping HTTP requests that cause jitter.
     const id = window.setInterval(() => {
       setSnapshotTick((value) => value + 1);
-    }, 2000);
+    }, 1000);
     return () => window.clearInterval(id);
-  }, [showStream, staticFirstFrame]);
+  }, [shouldRefreshSnapshot]);
+
 
   useEffect(() => {
-    setSnapshotErrored(false);
-  }, [snapshotTick]);
+    if (staticFirstFrame || !streamErrored) return undefined;
+    const id = window.setTimeout(() => {
+      // Only retry if the source still looks alive
+      if (statusRef.current === "live" || streamLoadedRef.current) {
+        setStreamErrored(false);
+        setStreamNonce((value) => value + 1);
+      }
+    }, 5000);
+    return () => window.clearTimeout(id);
+  }, [staticFirstFrame, streamErrored]);
 
   return (
     <div
@@ -302,42 +348,48 @@ export function CameraFeed({
         compact ? "aspect-[16/9]" : "aspect-video",
       )}
     >
+      {showSnapshot ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          key={`snapshot-${cameraId}-${staticFirstFrame ? "first" : "latest"}-${snapshotTick}`}
+          src={snapshotUrl}
+          alt={`${title} latest frame`}
+          className={cn("absolute inset-0 h-full w-full", mediaObjectClass)}
+          loading="lazy"
+          onLoad={() => {}}
+          onError={() => {
+            // Keep the last successful frame visible to avoid flickering.
+          }}
+        />
+      ) : null}
+
       {showStream ? (
         // eslint-disable-next-line @next/next/no-img-element
         <img
           key={`stream-${cameraId}-${streamNonce}`}
           src={streamUrl}
           alt={`${title} live feed`}
-          className="h-full w-full object-cover"
-          loading="lazy"
-          onError={() => setStreamErrored(true)}
+          className={cn("absolute inset-0 h-full w-full", mediaObjectClass)}
+          loading="eager"
+          onLoad={() => {
+            setStreamErrored(false);
+            setStreamReady(true);
+            streamLoadedRef.current = true;
+          }}
+          onError={() => {
+            setStreamReady(false);
+            setStreamErrored(true);
+          }}
         />
-      ) : (
-        <>
-          {showSnapshot ? (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img
-              key={`snapshot-${cameraId}-${staticFirstFrame ? "first" : "latest"}-${snapshotTick}`}
-              src={snapshotUrl}
-              alt={`${title} latest frame`}
-              className="h-full w-full object-cover"
-              loading="lazy"
-              onError={() => setSnapshotErrored(true)}
-            />
-          ) : null}
-          {snapshotErrored ? (
-            <div className="absolute inset-0 bg-[linear-gradient(160deg,#111a23_0%,#182939_45%,#263d4f_100%)]" />
-          ) : null}
-        </>
-      )}
+      ) : null}
 
-      {showStream || showSnapshot ? null : (
+      {showFallbackBackground ? (
         <div className="h-full w-full bg-[linear-gradient(160deg,#111a23_0%,#182939_45%,#263d4f_100%)]" />
-      )}
+      ) : null}
 
       <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.03)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.03)_1px,transparent_1px)] bg-[size:22px_22px]" />
 
-      {parsedZones.length > 0 ? (
+      {showFrontendZones && parsedZones.length > 0 ? (
         <svg className="absolute inset-0 h-full w-full" viewBox="0 0 100 100" preserveAspectRatio="none">
           {parsedZones.map((zone) => (
             <g key={zone.id}>
@@ -347,10 +399,11 @@ export function CameraFeed({
                     <polygon
                       key={`${zone.id}-poly-${i}`}
                       points={poly.map((point: {x: number, y: number}) => `${point.x},${point.y}`).join(" ")}
-                      fill="rgba(20, 184, 166, 0.2)"
-                      stroke="rgba(20, 184, 166, 0.95)"
-                      strokeWidth="0.8"
-                      strokeDasharray="2.4 1.6"
+                      fill="rgba(20, 184, 166, 0.15)"
+                      stroke="rgba(20, 184, 166, 0.98)"
+                      strokeWidth="1.2"
+                      strokeDasharray="3 2"
+
                     />
                   ))}
                   <text
@@ -391,8 +444,8 @@ export function CameraFeed({
         </svg>
       ) : null}
 
-      {/* RENDER BOXES ONLY IF NOT IN ENTRY/EXIT MODE */}
-      {parsedDetectionBoxes.length > 0 && (showStream || showSnapshot) && analyticsMode !== "entry_exit_count" ? (
+      {/* In facial-expression mode the backend stream already draws emotion overlays. */}
+      {parsedDetectionBoxes.length > 0 && (showStream || showSnapshot) && showFrontendPersonBoxes ? (
         <>
           {parsedDetectionBoxes.map((box) => (
             <div

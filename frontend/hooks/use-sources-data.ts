@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   type Camera,
@@ -28,7 +28,7 @@ export type SourceRow = {
   realtime: RealtimeCameraSnapshot | null;
   hasLiveFrame: boolean;
   status: SourceStatus;
-  type: "RTSP" | "Video File";
+  type: "RTSP" | "Video File" | "Webcam";
   endpoint: string;
   resolution: string;
   fps: number;
@@ -38,8 +38,9 @@ export type SourceRow = {
 export type SaveSourceInput = {
   cameraId?: number;
   name: string;
-  sourceType: "rtsp" | "file";
+  sourceType: "rtsp" | "file" | "webcam";
   rtspUrl: string;
+  webcamId?: string;
   file?: File | null;
   fileName: string;
   scheduleLabel: string;
@@ -83,9 +84,12 @@ function formatUptime(startedAt: string | null | undefined, status: SourceStatus
   return `${minutes}m`;
 }
 
-function sourceEndpoint(camera: Camera, sourceType: "RTSP" | "Video File"): string {
+function sourceEndpoint(camera: Camera, sourceType: "RTSP" | "Video File" | "Webcam"): string {
   if (sourceType === "RTSP") {
     return camera.rtsp_url || "-";
+  }
+  if (sourceType === "Webcam") {
+    return camera.rtsp_url ? camera.rtsp_url.replace("webcam://", "Device: ") : "Unknown Device";
   }
   const location = camera.location?.trim() || "";
   const fileFromLocation = location.includes("File:")
@@ -111,8 +115,9 @@ function sourceEndpoint(camera: Camera, sourceType: "RTSP" | "Video File"): stri
   return "Uploaded video";
 }
 
-function sourceTypeForCamera(camera: Camera): "RTSP" | "Video File" {
+function sourceTypeForCamera(camera: Camera): "RTSP" | "Video File" | "Webcam" {
   const source = (camera.rtsp_url || "").trim().toLowerCase();
+  if (source.startsWith("webcam://")) return "Webcam";
   if (source.startsWith("rtsp://") || source.startsWith("rtsps://")) return "RTSP";
   if (source.startsWith("file://")) return "Video File";
   return source ? "RTSP" : "Video File";
@@ -149,6 +154,7 @@ export function useSourcesData(options: Options = {}) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const realtimeRefreshRef = useRef<Promise<void> | null>(null);
 
   const refreshCore = useCallback(async () => {
     try {
@@ -162,14 +168,25 @@ export function useSourcesData(options: Options = {}) {
 
   const refreshRealtime = useCallback(async () => {
     if (!enableRealtime) return;
-    try {
-      const payload = await getRealtimeMonitoring();
-      setRealtime(payload.cameras);
-      setDetectorAvailable(payload.detector_available);
-      setAnalyticsRunning(payload.analytics_running);
-    } catch {
-      // Keep last successful realtime payload to avoid noisy UI on transient errors.
+    if (realtimeRefreshRef.current) {
+      return realtimeRefreshRef.current;
     }
+
+    const pending = (async () => {
+      try {
+        const payload = await getRealtimeMonitoring();
+        setRealtime(payload.cameras);
+        setDetectorAvailable(payload.detector_available);
+        setAnalyticsRunning(payload.analytics_running);
+      } catch {
+        // Keep last successful realtime payload to avoid noisy UI on transient errors.
+      } finally {
+        realtimeRefreshRef.current = null;
+      }
+    })();
+
+    realtimeRefreshRef.current = pending;
+    return pending;
   }, [enableRealtime]);
 
   useEffect(() => {
@@ -193,8 +210,12 @@ export function useSourcesData(options: Options = {}) {
   const refreshAll = useCallback(async () => {
     setBusy(true);
     setError("");
-    await Promise.all([refreshCore(), refreshRealtime()]);
-    setBusy(false);
+    try {
+      await refreshCore();
+      void refreshRealtime();
+    } finally {
+      setBusy(false);
+    }
   }, [refreshCore, refreshRealtime]);
 
   useEffect(() => {
@@ -234,15 +255,17 @@ export function useSourcesData(options: Options = {}) {
       .map((camera) => {
         const stream = streamByCamera.get(camera.id) ?? null;
         const snapshot = realtimeByCamera.get(camera.id) ?? null;
-        const streamStatus = stream?.status ?? snapshot?.stream_status;
+        const streamStatus = snapshot?.stream_status ?? stream?.status;
         const type = sourceTypeForCamera(camera);
-        const status = statusFromStream(streamStatus, Boolean(camera.rtsp_url?.trim()));
+        const hasLiveFrame = Boolean(snapshot?.has_live_frame);
+        const inferredStatus = statusFromStream(streamStatus, Boolean(camera.rtsp_url?.trim()));
+        const status: SourceStatus = hasLiveFrame ? "live" : inferredStatus;
 
         return {
           camera,
           stream,
           realtime: snapshot,
-          hasLiveFrame: Boolean(snapshot?.has_live_frame),
+          hasLiveFrame,
           status,
           type,
           endpoint: sourceEndpoint(camera, type),
@@ -293,7 +316,8 @@ export function useSourcesData(options: Options = {}) {
       } catch (err) {
         setError(toErrorMessage(err, "Failed to toggle stream"));
       } finally {
-        await Promise.all([refreshCore(), refreshRealtime()]);
+        await refreshCore();
+        void refreshRealtime();
         setBusy(false);
       }
     },
@@ -307,11 +331,15 @@ export function useSourcesData(options: Options = {}) {
       setNotice("");
       try {
         await deleteCamera(cameraId);
+        setCameras((previous) => previous.filter((camera) => camera.id !== cameraId));
+        setStreams((previous) => previous.filter((stream) => stream.camera_id !== cameraId));
+        setRealtime((previous) => previous.filter((snapshot) => snapshot.camera_id !== cameraId));
         setNotice(`Deleted camera #${cameraId}`);
       } catch (err) {
         setError(toErrorMessage(err, "Failed to delete source"));
       } finally {
-        await Promise.all([refreshCore(), refreshRealtime()]);
+        void refreshCore();
+        void refreshRealtime();
         setBusy(false);
       }
     },
@@ -351,6 +379,23 @@ export function useSourcesData(options: Options = {}) {
           } else {
             throw new Error("Select a video file to upload");
           }
+        } else if (input.sourceType === "webcam") {
+          const deviceUrl = `webcam://${input.webcamId?.trim() || "0"}`;
+          if (input.cameraId) {
+            camera = await updateCamera(input.cameraId, {
+              name,
+              rtsp_url: deviceUrl,
+              location,
+            });
+            setNotice(`Updated source #${camera.id}`);
+          } else {
+            camera = await createCamera({
+              name,
+              rtsp_url: deviceUrl,
+              location,
+            });
+            setNotice(`Created source #${camera.id}`);
+          }
         } else {
           const trimmedRtspUrl = input.rtspUrl.trim();
           if (input.cameraId) {
@@ -375,7 +420,8 @@ export function useSourcesData(options: Options = {}) {
           setNotice(`Source #${camera.id} saved and stream started`);
         }
 
-        await Promise.all([refreshCore(), refreshRealtime()]);
+        await refreshCore();
+        void refreshRealtime();
         return camera;
       } catch (err) {
         setError(toErrorMessage(err, "Failed to save source"));
@@ -395,7 +441,7 @@ export function useSourcesData(options: Options = {}) {
       const state = await startAnalyticsRun();
       setAnalyticsRunning(state.running);
       setNotice("Analytics started");
-      await refreshRealtime();
+      void refreshRealtime();
     } catch (err) {
       setError(toErrorMessage(err, "Failed to start analytics"));
     } finally {
@@ -411,7 +457,7 @@ export function useSourcesData(options: Options = {}) {
       const state = await stopAnalyticsRun();
       setAnalyticsRunning(state.running);
       setNotice("Analytics stopped");
-      await refreshRealtime();
+      void refreshRealtime();
     } catch (err) {
       setError(toErrorMessage(err, "Failed to stop analytics"));
     } finally {

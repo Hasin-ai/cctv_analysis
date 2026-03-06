@@ -16,6 +16,13 @@ class TotalPersonDetectionRequest(BaseModel):
     end: str
 
 
+class FacialExpressionRecognitionRequest(BaseModel):
+    camera_id: int
+    zone_id: int | None = None
+    start: str
+    end: str
+
+
 class AnalysisJobResponse(BaseModel):
     id: int
     camera_id: int
@@ -60,3 +67,32 @@ class TotalPersonDetectionResponse(BaseModel):
     max_person_count: int
     avg_person_count: float
     series: list[TotalPersonFrameCount]
+
+
+class FacialExpressionFrameResult(BaseModel):
+    frame_id: int
+    timestamp: str | None
+    analyzed_faces: int
+    dominant_emotion: str | None
+    emotion_counts: dict[str, int]
+    avg_age: float | None = None
+    dominant_gender: str | None = None
+
+
+class FacialExpressionRecognitionResponse(BaseModel):
+    camera_id: int
+    zone_id: int | None = None
+    zone_name: str | None
+    start_time: str
+    end_time: str
+    detector_available: bool
+    processed_frames: int
+    analyzed_faces: int
+    dominant_emotion: str | None
+    emotion_counts: dict[str, int]
+    emotion_percentages: dict[str, float]
+    avg_age: float | None = None
+    gender_counts: dict[str, int] = {}
+    age_distribution: dict[str, int] = {}
+    series: list[FacialExpressionFrameResult]
+

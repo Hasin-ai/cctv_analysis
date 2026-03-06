@@ -10,6 +10,8 @@ from app.db.session import get_session
 from app.models.analyzer import (
     AnalysisJobResponse,
     AnalysisRequest,
+    FacialExpressionRecognitionRequest,
+    FacialExpressionRecognitionResponse,
     TotalPersonDetectionRequest,
     TotalPersonDetectionResponse,
 )
@@ -52,6 +54,17 @@ async def detect_total_persons(
     session: AsyncSession = Depends(get_session),
 ):
     return await analyzer_controller.detect_total_persons(session, request)
+
+
+@router.post(
+    "/facial-expression-recognition",
+    response_model=FacialExpressionRecognitionResponse,
+)
+async def detect_facial_expressions(
+    request: FacialExpressionRecognitionRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    return await analyzer_controller.detect_facial_expressions(session, request)
 
 
 @router.get("/jobs")

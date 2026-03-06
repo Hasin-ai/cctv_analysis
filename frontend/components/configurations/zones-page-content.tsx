@@ -13,6 +13,7 @@ import {
   getAnalyticsRunState,
   listZones,
   runAnalyzerAnalysis,
+  runFacialExpressionRecognition,
   getRealtimeMonitoring,
   startStream,
   startAnalyticsRun,
@@ -329,7 +330,8 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
       try {
         await stopStream({ camera_id: selectedCameraId });
         if (cancelled) return;
-        await Promise.all([refreshCore(), refreshRealtime()]);
+        await refreshCore();
+        void refreshRealtime();
         if (!cancelled) {
           setNotice("Capture is paused. Use Save & Start Processing to begin frame capture.");
         }
@@ -784,7 +786,7 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
         if (!state.running) {
           throw new Error("Realtime analytics could not be started");
         }
-        await refreshRealtime();
+        void refreshRealtime();
       } else {
         const state = await getAnalyticsRunState();
         if (!state.running) {
@@ -798,7 +800,8 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
         currentStatus = started.status === "running" ? "live" : currentStatus;
       }
       if (currentStatus !== "live") {
-        await Promise.all([refreshCore(), refreshRealtime()]);
+        await refreshCore();
+        void refreshRealtime();
       }
 
       const newTasks: LocalAnalyticsTask[] = [];
@@ -810,7 +813,7 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
             // to prevent the backend YOLO analyzer from failing with "No frames found"
             let liveCamSource = null;
             for (let i = 0; i < 10; i++) {
-              const monitoring = await getRealtimeMonitoring();
+              const monitoring = await getRealtimeMonitoring([selectedCameraId]);
               const cam = monitoring.cameras.find((c) => c.camera_id === selectedCameraId);
               if (cam?.has_live_frame) {
                 liveCamSource = cam;
@@ -857,7 +860,7 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
             // to prevent the backend queue analyzer from failing with "No frames found"
             let liveCamSource = null;
             for (let i = 0; i < 10; i++) {
-              const monitoring = await getRealtimeMonitoring();
+              const monitoring = await getRealtimeMonitoring([selectedCameraId]);
               const cam = monitoring.cameras.find((c) => c.camera_id === selectedCameraId);
               if (cam?.has_live_frame) {
                 liveCamSource = cam;
@@ -892,6 +895,54 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
               zoneName: selectedZone.name,
               status: "failed",
               message: err instanceof Error ? err.message : "Failed to start Queue Analytics",
+              createdAt: new Date().toISOString(),
+            });
+          }
+          continue;
+        }
+
+        if (mode === "facial_expression") {
+          try {
+            // Wait up to 10 seconds for the camera stream to ingest its first frame into SQLite.
+            let liveCamSource = null;
+            for (let i = 0; i < 10; i++) {
+              const monitoring = await getRealtimeMonitoring([selectedCameraId]);
+              const cam = monitoring.cameras.find((c) => c.camera_id === selectedCameraId);
+              if (cam?.has_live_frame) {
+                liveCamSource = cam;
+                break;
+              }
+              await new Promise((resolve) => setTimeout(resolve, 1000));
+            }
+
+            if (!liveCamSource) {
+              throw new Error("Timeout waiting for camera to capture its first frame. Please ensure the RTSP source is active.");
+            }
+
+            const window = buildAnalysisWindow(liveCamSource.frame_timestamp);
+            const response = await runFacialExpressionRecognition({
+              camera_id: selectedCameraId,
+              zone_id: selectedZone.id,
+              start: window.start,
+              end: window.end,
+            });
+
+            const emotionLabel = response.dominant_emotion ?? "No dominant emotion";
+            newTasks.push({
+              id: taskId,
+              mode,
+              zoneName: selectedZone.name,
+              status: "completed",
+              message: `Facial Expression completed (${response.analyzed_faces} faces, dominant: ${emotionLabel})`,
+              createdAt: new Date().toISOString(),
+            });
+          } catch (err) {
+            newTasks.push({
+              id: taskId,
+              mode,
+              zoneName: selectedZone.name,
+              status: "failed",
+              message: err instanceof Error ? err.message : "Failed to run Facial Expression",
               createdAt: new Date().toISOString(),
             });
           }

@@ -16,6 +16,7 @@ from app.services.boxmot_utils import (
     ensure_strongsort_outputs,
     resolve_strongsort_config_path,
 )
+from app.services.yolo_threadsafe import build_locked_callable
 from app.services.yolo_person_classes import resolve_person_class_ids
 from app.services.zone_geometry import region_points_from_polygon
 
@@ -149,6 +150,7 @@ class PersonTrackingService:
         self._available = False
         self._init_error: str | None = None
         self._yolo = None
+        self._predict = None
         self._cv2 = None
         self._np = None
         self._create_tracker = None
@@ -170,6 +172,7 @@ class PersonTrackingService:
             import boxmot  # type: ignore
 
             self._yolo = YOLO(settings.yolo_model_path)
+            self._predict = build_locked_callable(self._yolo.predict)
             self._cv2 = cv2
             self._np = np
             self._create_tracker = create_tracker
@@ -208,6 +211,7 @@ class PersonTrackingService:
         return (
             self._available
             and self._yolo is not None
+            and self._predict is not None
             and self._cv2 is not None
             and self._np is not None
             and self._create_tracker is not None
@@ -483,7 +487,7 @@ class PersonTrackingService:
             predict_kwargs["classes"] = self._person_class_ids
 
         try:
-            results = self._yolo.predict(image, **predict_kwargs)
+            results = self._predict(image, **predict_kwargs)
             boxes = results[0].boxes if results and results[0].boxes is not None else None
             if boxes is None:
                 return self._np.empty((0, 6), dtype=self._np.float32)

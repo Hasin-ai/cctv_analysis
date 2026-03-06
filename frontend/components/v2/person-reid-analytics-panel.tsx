@@ -1,10 +1,17 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useMemo } from "react";
 import { type AnalyzerJob, type AnalyzerStats, type AnalyzerTrack, getAnalyzerStats, getAnalyzerTracks, listAnalyzerJobs, createReconstruction, getReconstruction } from "@/lib/api";
+import { parseSelectedZoneId } from "@/lib/zone-selection";
 import { Loader2, RefreshCcw, User, Video, PlaySquare } from "lucide-react";
 
-export function PersonReidAnalyticsPanel({ cameraId }: { cameraId: number }) {
+export function PersonReidAnalyticsPanel({
+  cameraId,
+  selectedZoneId = "",
+}: {
+  cameraId: number;
+  selectedZoneId?: string;
+}) {
   const [jobs, setJobs] = useState<AnalyzerJob[]>([]);
   const [selectedJob, setSelectedJob] = useState<AnalyzerJob | null>(null);
   const [stats, setStats] = useState<AnalyzerStats | null>(null);
@@ -16,6 +23,9 @@ export function PersonReidAnalyticsPanel({ cameraId }: { cameraId: number }) {
   const [reconstructionVideoUrl, setReconstructionVideoUrl] = useState<string | null>(null);
   const [generatingVideo, setGeneratingVideo] = useState(false);
   const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const facialExpressionZoneId = useMemo(() => {
+    return parseSelectedZoneId(selectedZoneId);
+  }, [selectedZoneId]);
 
   useEffect(() => {
     let active = true;
@@ -89,6 +99,8 @@ export function PersonReidAnalyticsPanel({ cameraId }: { cameraId: number }) {
         end_time: selectedJob.end_time,
         analysis_job_id: selectedJob.id,
         draw_tracking: true,
+        draw_facial_expression: true,
+        facial_expression_zone_id: facialExpressionZoneId,
       });
 
       pollIntervalRef.current = setInterval(async () => {
@@ -97,7 +109,7 @@ export function PersonReidAnalyticsPanel({ cameraId }: { cameraId: number }) {
           setReconstructionStatus(`Generation Status: ${statusResult.status}`);
           if (statusResult.status === "completed") {
             if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-            setReconstructionVideoUrl(`/api/backend/api/v1/reconstructions/${job.id}/download`);
+            setReconstructionVideoUrl(`/api/backend/api/reconstructions/${job.id}/download`);
             setGeneratingVideo(false);
           } else if (statusResult.status === "failed") {
             if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
