@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///./data/app.db"
     service_role: str = "fetcher"
     stream_tick_seconds: float = 1.0
-    stream_heartbeat_timeout_seconds: float = 5.0
+    stream_heartbeat_timeout_seconds: float = 30.0
     max_streams: int = 16
 
     ffmpeg_path: str = "ffmpeg"
@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     retention_days: int = 7
     config_backup_path: str = "./data/config-backup.json"
     analytics_use_yolo: bool = True
-    yolo_model_path: str = "./data/models/best.pt"
+    yolo_model_path: str = "/Users/bs00851/Documents/cctv_analysis/data/models/yolo26x.pt"
     yolo_confidence: float = 0.3
     yolo_iou: float = 0.5
     yolo_tracker: str = "botsort.yaml"
@@ -58,11 +58,12 @@ class Settings(BaseSettings):
     facial_expression_frame_stride: int = 10
     facial_expression_max_frames: int = 180
     facial_expression_face_scale_factor: float = 1.1
-    facial_expression_face_min_neighbors: int = 5
-    facial_expression_min_face_size: int = 24
-    facial_expression_face_confidence_threshold: float = 0.01
+    facial_expression_face_min_neighbors: int = 3
+    facial_expression_min_face_size: int = 15
+    facial_expression_face_confidence_threshold: float = 0.0
+    facial_expression_detector_backend: str = "opencv"
     facial_expression_realtime_interval_seconds: float = 0.04
-    facial_expression_realtime_cache_ttl_seconds: float = 0.4
+    facial_expression_realtime_cache_ttl_seconds: float = 2.0
 
     model_config = SettingsConfigDict(
         env_prefix="",

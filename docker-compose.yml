@@ -18,7 +18,7 @@ services:
       FACIAL_EXPRESSION_FACE_CONFIDENCE_THRESHOLD: "0.01"
       FACIAL_EXPRESSION_REALTIME_INTERVAL_SECONDS: "0.04"
       FACIAL_EXPRESSION_REALTIME_CACHE_TTL_SECONDS: "0.4"
-      YOLO_MODEL_PATH: "/app/data/models/best.pt"
+      YOLO_MODEL_PATH: "/Users/bs00851/Documents/cctv_analysis/data/models/yolo26x.pt"
       YOLO_CONFIDENCE: "0.3"
       BOXMOT_REID_WEIGHTS: "/app/data/models/osnet_x0_25_msmt17.pt"
       PERSONVIT_REID_WEIGHTS: "/app/data/models/personvit/checkpoint0260.pth"
@@ -26,6 +26,7 @@ services:
       PERSONVIT_SIMILARITY_THRESHOLD: "0.6"
     volumes:
       - ./data:/app/data
+      - /Users/bs00851/Documents/cctv_analysis:/Users/bs00851/Documents/cctv_analysis:ro
       - ~/.deepface:/root/.deepface
     healthcheck:
       test:

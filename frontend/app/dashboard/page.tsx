@@ -6,6 +6,7 @@ import { Pencil, Pause, Play, Plus, Search, Trash2, Filter } from "lucide-react"
 
 import type { RealtimeZoneCount } from "@/lib/api";
 import { type FootfallResponse, type Zone, getFootfall, listZones } from "@/lib/api";
+import { isZoneFilterSelected, parseSelectedZoneId } from "@/lib/zone-selection";
 import { useSourcesData } from "@/hooks/use-sources-data";
 import {
   CameraFeed,
@@ -60,7 +61,7 @@ function ModeAnalyticsPanel({
   zones = [],
   liveZones = [],
   footfall = null,
-  selectedZoneId = "all",
+  selectedZoneId = "",
   isPersonCountMode = false,
   sourceType = "RTSP",
 }: {
@@ -76,6 +77,7 @@ function ModeAnalyticsPanel({
     ts: Date.now(),
     person: 0,
   };
+  const selectedZoneNumber = useMemo(() => parseSelectedZoneId(selectedZoneId), [selectedZoneId]);
 
   const avgPerson =
     timeline.length > 0
@@ -132,7 +134,7 @@ function ModeAnalyticsPanel({
         <MiniLineChart values={timeline.map((point) => point.person)} />
       </div>
       
-      {zones.length > 0 && (!selectedZoneId || selectedZoneId === "all") && (
+      {zones.length > 0 && selectedZoneNumber === null && (
         <div className="overflow-x-auto rounded-xl border border-border/70 bg-white/80 mt-3">
           <table className="min-w-full text-left text-xs">
             <thead className="bg-muted/40 text-muted-foreground">
@@ -179,13 +181,14 @@ function EntryExitAnalyticsPanel({
   footfall,
   liveZones = [],
   searchQuery = "",
-  selectedZoneId = "all",
+  selectedZoneId = "",
 }: {
   footfall: FootfallResponse | null;
   liveZones?: RealtimeZoneCount[];
   searchQuery?: string;
   selectedZoneId?: string;
 }) {
+  const selectedZoneNumber = useMemo(() => parseSelectedZoneId(selectedZoneId), [selectedZoneId]);
   const hasRealEvents = useMemo(() => {
     if (!footfall) return false;
     if (footfall.total_entries > 0 || footfall.total_exits > 0) return true;
@@ -197,11 +200,8 @@ function EntryExitAnalyticsPanel({
 
     // First apply explicit Zone ID filter if set
     let activeTotals = footfall.zone_totals || [];
-    if (selectedZoneId && selectedZoneId !== "all") {
-      const zoneIdNum = Number(selectedZoneId);
-      if (!Number.isNaN(zoneIdNum)) {
-        activeTotals = activeTotals.filter((t) => t.zone_id === zoneIdNum);
-      }
+    if (selectedZoneNumber !== null) {
+      activeTotals = activeTotals.filter((t) => t.zone_id === selectedZoneNumber);
     }
 
     // Hide placeholder all-zero rows (configured zones without real transitions AND zero live presence).
@@ -218,12 +218,11 @@ function EntryExitAnalyticsPanel({
       const name = z.zone_name ?? `Zone ${z.zone_id ?? "-"}`;
       return name.toLowerCase().includes(lower);
     });
-  }, [footfall, searchQuery, selectedZoneId, liveZones]);
+  }, [footfall, searchQuery, selectedZoneNumber, liveZones]);
 
   const activeZoneSeriesData = useMemo(() => {
-    if (!footfall || !selectedZoneId || selectedZoneId === "all") return null;
-    const zNum = Number(selectedZoneId);
-    if (Number.isNaN(zNum)) return null;
+    if (!footfall || selectedZoneNumber === null) return null;
+    const zNum = selectedZoneNumber;
 
     const zName = footfall.zone_totals?.find(t => t.zone_id === zNum)?.zone_name ?? `Zone ${zNum}`;
     const pts = footfall.series.filter(pt => pt.zone_id === zNum);
@@ -234,7 +233,7 @@ function EntryExitAnalyticsPanel({
       entries: { id: "in", name: "Entries", color: "#0f766e", values: recent.map(p => p.entry_count) },
       exits: { id: "out", name: "Exits", color: "#dc2626", values: recent.map(p => p.exit_count) },
     };
-  }, [footfall, selectedZoneId]);
+  }, [footfall, selectedZoneNumber]);
 
   const peakTrafficWindow = useMemo(
     () => formatTimeOnlyRange(footfall?.peak_traffic_hour?.hour_start, footfall?.peak_traffic_hour?.hour_end),
@@ -275,7 +274,7 @@ function EntryExitAnalyticsPanel({
         <StatTile label="Estimated Occupancy" value={Math.max(footfall.net_flow, 0)} hint="Derived occupancy trend" />
       </div>
 
-      {selectedZoneId && selectedZoneId !== "all" && activeZoneSeriesData ? (
+      {selectedZoneNumber !== null && activeZoneSeriesData ? (
         <div className="rounded-xl border border-border/70 bg-white/80 p-3">
           <p className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">Traffic Trend ({activeZoneSeriesData.name})</p>
           <div className="mb-2 space-y-2">
@@ -398,7 +397,7 @@ export default function DashboardPage() {
 
   const [selectedCameraId, setSelectedCameraId] = useState<number | null>(null);
   const [queryCameraId, setQueryCameraId] = useState<number | null>(null);
-  const [selectedZoneId, setSelectedZoneId] = useState<string>("all");
+  const [selectedZoneId, setSelectedZoneId] = useState<string>("");
   const [historyByCamera, setHistoryByCamera] = useState<Record<string, TimelinePoint[]>>({});
   const [zonesByCamera, setZonesByCamera] = useState<Record<number, Zone[]>>({});
   const [footfallByCamera, setFootfallByCamera] = useState<Record<number, FootfallResponse>>({});
@@ -465,9 +464,9 @@ export default function DashboardPage() {
         if (!source.realtime) continue;
         // If a specific zone is selected, use that zone's live counts for the timeline
         let currentPerson = source.realtime.total_person_count;
+        const zoneId = parseSelectedZoneId(selectedZoneId);
 
-        if (selectedZoneId !== "all") {
-          const zoneId = Number(selectedZoneId);
+        if (zoneId !== null) {
           const activeZone = source.realtime.zones?.find((z) => z.zone_id === zoneId);
           if (activeZone) {
             currentPerson = activeZone.person_count;
@@ -476,7 +475,7 @@ export default function DashboardPage() {
           }
         }
 
-        const historyKey = `${source.camera.id}-${selectedZoneId}`;
+        const historyKey = `${source.camera.id}-${zoneId ?? "none"}`;
         const list = next[historyKey] ?? [];
         const point = toTimelinePoint(currentPerson);
         next[historyKey] = [...list.slice(-23), point];
@@ -505,24 +504,25 @@ export default function DashboardPage() {
   }, [loadZones, selectedCameraId]);
 
   useEffect(() => {
-    if (selectedZoneId === "all") return;
+    if (!selectedZoneId) return;
     if (!selectedCameraId) {
-      setSelectedZoneId("all");
+      setSelectedZoneId("");
       return;
     }
 
     const cameraZones = zonesByCamera[selectedCameraId] ?? [];
     const zoneExists = cameraZones.some((zone) => zone.id.toString() === selectedZoneId);
     if (!zoneExists) {
-      setSelectedZoneId("all");
+      setSelectedZoneId("");
     }
   }, [selectedCameraId, selectedZoneId, zonesByCamera]);
 
   const loadFootfall = useCallback(async (cameraId: number, zoneId: string) => {
     try {
+      const parsedZoneId = parseSelectedZoneId(zoneId);
       const payload = await getFootfall({
         cameraId,
-        zoneId: zoneId !== "all" ? Number(zoneId) : undefined,
+        zoneId: parsedZoneId ?? undefined,
         start: getStartTimestamp(),
       });
       setFootfallByCamera((previous) => ({
@@ -547,7 +547,7 @@ export default function DashboardPage() {
   const selected = selectedCameraId ? sourceById.get(selectedCameraId) ?? null : null;
   const selectedTimeline = useMemo(() => {
     if (!selected) return [];
-    const historyKey = `${selected.camera.id}-${selectedZoneId}`;
+    const historyKey = `${selected.camera.id}-${parseSelectedZoneId(selectedZoneId) ?? "none"}`;
     const series = historyByCamera[historyKey] ?? [];
     if (series.length === 0) {
       return [toTimelinePoint(0)];
@@ -752,16 +752,6 @@ export default function DashboardPage() {
             subtitle="Live feed and detection overlay while analytics is running"
             right={
               <div className="flex items-center gap-2">
-                {selected ? (
-                  <button
-                    type="button"
-                    onClick={() => setShowZoneEditor(true)}
-                    className="flex items-center rounded-lg border border-primary/40 bg-primary/10 px-3 py-1.5 text-xs font-semibold text-primary transition hover:bg-primary/20 whitespace-nowrap"
-                  >
-                    <Pencil className="mr-1.5 h-3.5 w-3.5" />
-                    Quick-Edit Zones
-                  </button>
-                ) : null}
                 <select
                   value={overlayMode}
                   onChange={(e) => setOverlayMode(e.target.value as AnalyticsMode)}
@@ -778,7 +768,7 @@ export default function DashboardPage() {
                   onChange={(e) => setSelectedZoneId(e.target.value)}
                   className="h-9 rounded-lg border border-input bg-white px-3 text-sm text-foreground shadow-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
                 >
-                  <option value="all">Compare All Zones</option>
+                  <option value="">Select a Zone</option>
                   {selected && zonesByCamera[selected.camera.id]?.map((z) => (
                     <option key={z.id} value={z.id.toString()}>
                       {z.name}
@@ -802,50 +792,9 @@ export default function DashboardPage() {
                   hasLiveFrame={selected.hasLiveFrame}
                   staticFirstFrame={false}
                   analyticsMode={overlayMode}
-                  zoneId={selectedZoneId !== "all" ? selectedZoneId : undefined}
+                  zoneId={selectedZoneId || undefined}
                 />
 
-                <div className="mt-3 grid gap-3 md:grid-cols-2 lg:grid-cols-3">
-                  {(zonesByCamera[selected.camera.id] ?? [])
-                    .filter((zone) => selectedZoneId === "all" || zone.id.toString() === selectedZoneId)
-                    .map((zone) => {
-                    const activeRealtime = selected.realtime?.zones?.find(z => z.zone_id === zone.id);
-                    const personCount = activeRealtime?.person_count ?? 0;
-                    
-                    const zoneStats = selectedFootfall?.zone_totals?.find(z => z.zone_id === zone.id);
-                    const entries = zoneStats?.total_entries ?? 0;
-                    const exits = zoneStats?.total_exits ?? 0;
-
-                    return (
-                      <div key={zone.id} className="relative overflow-hidden flex flex-col rounded-xl border border-border/70 bg-white shadow-sm transition hover:shadow-md">
-                        <div className="absolute left-2 top-2 z-10 rounded bg-slate-900/80 px-2 py-1 text-xs font-semibold text-white backdrop-blur">
-                          {zone.name}
-                        </div>
-                        <div className="aspect-video bg-slate-100 shrink-0">
-                          <CameraFeed
-                            cameraId={selected.camera.id}
-                            title={zone.name}
-                            status={selected.status}
-                            resolution={selected.resolution}
-                            fps={selected.fps}
-                            detectionBoxes={selected.realtime?.detection_boxes ?? []}
-                            hasLiveFrame={selected.hasLiveFrame}
-                            compact
-                            staticFirstFrame={false}
-                            analyticsMode={overlayMode}
-                            zoneId={zone.id.toString()}
-                          />
-                        </div>
-                        <div className="bg-muted/30 p-2 border-t border-border/50 text-[11px] grid grid-cols-4 gap-2 text-center select-none">
-                          <div className="flex flex-col"><span className="text-muted-foreground uppercase tracking-widest text-[9px] font-bold">Live</span><span className="font-semibold text-sky-700 text-sm">{personCount}</span></div>
-                          <div className="flex flex-col"><span className="text-muted-foreground uppercase tracking-widest text-[9px] font-bold">In</span><span className="font-semibold text-emerald-700 text-sm">{entries}</span></div>
-                          <div className="flex flex-col"><span className="text-muted-foreground uppercase tracking-widest text-[9px] font-bold">Out</span><span className="font-semibold text-rose-700 text-sm">{exits}</span></div>
-                          <div className="flex flex-col"><span className="text-muted-foreground uppercase tracking-widest text-[9px] font-bold">Status</span><span className="font-semibold text-muted-foreground">{personCount > 0 ? "Active" : "Clear"}</span></div>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
               </>
             ) : (
               <p className="text-sm text-muted-foreground">No source selected.</p>
@@ -912,7 +861,7 @@ export default function DashboardPage() {
               >
                 <div className="rounded-xl border border-border/70 bg-white/80 px-4 py-3 text-sm text-slate-700">
                   Trajectory heatmap overlay is active on the video feed.
-                  {selectedZoneId !== "all"
+                  {isZoneFilterSelected(selectedZoneId)
                     ? " Density is computed from tracked object paths inside the selected zone."
                     : " Density is computed from tracked object paths across the full frame."}
                 </div>
@@ -922,7 +871,11 @@ export default function DashboardPage() {
             {showFacialExpressionPanel ? (
               <PanelCard
                 title="Facial Expression Recognition"
-                subtitle="Emotion recognition for faces detected inside the selected zone"
+                subtitle={
+                  isZoneFilterSelected(selectedZoneId)
+                    ? "Emotion recognition for faces detected inside the selected zone"
+                    : "Emotion recognition for faces detected inside configured zones"
+                }
               >
                 <FacialExpressionPanel
                   cameraId={selected.camera.id}

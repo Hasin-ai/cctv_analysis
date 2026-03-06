@@ -5,7 +5,7 @@ import logging
 import subprocess
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -27,16 +27,17 @@ from app.services.trajectory_heatmap import get_trajectory_heatmap_service
 from app.services.zone_crop import crop_image_to_zone
 from app.services.zone_geometry import line_points_from_polygon
 
-_analytics_running = False
+_analytics_running = True
 _SOURCE_FRAME_TIMEOUT_SECONDS = 12
 _FACIAL_EXPRESSION_RETRY_SECONDS = 30.0
 _FACIAL_REALTIME_DEFAULT_INTERVAL_SECONDS = 0.04
-_FACIAL_REALTIME_DEFAULT_CACHE_TTL_SECONDS = 0.12
+_FACIAL_REALTIME_DEFAULT_CACHE_TTL_SECONDS = 2.0
 _facial_expression_service: FacialExpressionRecognitionService | None = None
 _facial_expression_retry_after_monotonic = 0.0
 _facial_detection_cache: dict[int, "_FacialDetectionCacheEntry"] = {}
 _facial_detection_locks: dict[int, asyncio.Lock] = {}
 _facial_detection_tasks: dict[int, asyncio.Task[Any]] = {}
+_realtime_monitoring_tasks: set[asyncio.Task[Any]] = set()
 logger = logging.getLogger(__name__)
 
 
@@ -47,6 +48,36 @@ class _FacialDetectionCacheEntry:
     frame_width: int
     frame_height: int
     detections: list[dict[str, Any]]
+
+
+async def _refresh_realtime_count_cache(
+    service,
+    camera_id: int,
+    frame_path: str,
+    zones: list[Any],
+) -> None:
+    try:
+        await asyncio.to_thread(service.refresh_cached_result, camera_id, frame_path, zones)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Realtime count refresh failed for camera %s: %s", camera_id, exc)
+
+
+async def _get_realtime_count_snapshot(
+    service,
+    camera_id: int,
+    frame_path: str,
+    zones: list[Any],
+) -> dict[str, Any]:
+    result, should_refresh = service.get_cached_result(camera_id, frame_path, zones)
+    if should_refresh:
+        task = asyncio.create_task(_refresh_realtime_count_cache(service, camera_id, frame_path, zones))
+        _realtime_monitoring_tasks.add(task)
+
+        def _cleanup(done_task: asyncio.Task[Any]) -> None:
+            _realtime_monitoring_tasks.discard(done_task)
+
+        task.add_done_callback(_cleanup)
+    return result
 
 
 def _is_entry_exit_mode(analytics_mode: str | None) -> bool:
@@ -319,8 +350,9 @@ async def _get_facial_detections_for_frame(
             _FACIAL_REALTIME_DEFAULT_CACHE_TTL_SECONDS,
         )
     )
-    # Keep stale overlay reuse short to avoid visibly misaligned boxes on moving faces.
-    cache_ttl_seconds = max(min_interval_seconds * 2.0, min(configured_cache_ttl, 0.12))
+    # Allow cached detections to persist across several frames so the overlay
+    # stays visible while the next DeepFace analysis runs in the background.
+    cache_ttl_seconds = max(min_interval_seconds * 3.0, configured_cache_ttl, 2.0)
     _prune_facial_detection_cache(now, cache_ttl_seconds)
 
     cached = _facial_detection_cache.get(camera_id)
@@ -539,6 +571,18 @@ async def realtime(session: AsyncSession, camera_ids: list[int] | None = None):
     service = get_realtime_monitoring_service()
     analytics_running = _analytics_running
     heartbeat_timeout = timedelta(seconds=max(1.0, float(settings.stream_heartbeat_timeout_seconds)))
+
+    def _is_frame_fresh(frame: Any | None) -> bool:
+        if frame is None or frame.timestamp is None:
+            return False
+        frame_timestamp = frame.timestamp
+        if frame_timestamp.tzinfo is not None:
+            now = datetime.now(timezone.utc)
+            frame_timestamp = frame_timestamp.astimezone(timezone.utc)
+        else:
+            now = datetime.utcnow()
+        return now - frame_timestamp <= heartbeat_timeout
+
     output = []
     for camera in cameras:
         stream = await crud.get_stream_by_camera(session, camera.id)
@@ -546,22 +590,25 @@ async def realtime(session: AsyncSession, camera_ids: list[int] | None = None):
         latest_frame = await crud.get_latest_frame(session, camera.id)
 
         has_frame = latest_frame is not None and Path(latest_frame.path).exists()
+        frame_fresh = _is_frame_fresh(latest_frame) if has_frame else False
         frame_timestamp = latest_frame.timestamp.isoformat() if latest_frame else None
         stream_status = stream.status.value if stream else "stopped"
         heartbeat_fresh = False
         if stream and stream.last_heartbeat:
             heartbeat_fresh = datetime.utcnow() - stream.last_heartbeat <= heartbeat_timeout
-        has_live_frame = has_frame and (stream is None or (stream_status == "running" and heartbeat_fresh))
-        if stream and stream_status == "running" and not heartbeat_fresh:
+        stream_running = stream is not None and stream_status == "running" and (heartbeat_fresh or frame_fresh)
+        if stream is None and frame_fresh:
+            stream_status = "running"
+        elif stream and stream_status == "running" and not stream_running:
             stream_status = "stopped"
+        has_live_frame = has_frame and (stream_running or (stream is None and frame_fresh))
 
         if analytics_running and has_live_frame and latest_frame:
-            result = await asyncio.to_thread(service.count_people, latest_frame.path, zones)
+            result = await _get_realtime_count_snapshot(service, camera.id, latest_frame.path, zones)
             zone_counts = result["zone_counts"]
             detection_boxes = result.get("detection_boxes", [])
-            total_people_in_zones = int(result["total_in_zones"])
-            # Person counting is zone-constrained by requirement.
-            total_detected_people = total_people_in_zones
+            total_people_in_zones = int(result.get("total_in_zones", 0))
+            total_detected_people = int(result.get("total_detected", total_people_in_zones))
         else:
             zone_counts = {zone.id: 0 for zone in zones}
             detection_boxes = []
@@ -627,15 +674,10 @@ async def latest_frame(
     camera_zones: list[Any] = []
     facial_expression_zone_filter = zone
     trajectory_zone_filter = zone
-    if (
-        (facial_expression_mode and facial_expression_zone_filter is None)
-        or (trajectory_heatmap_mode and trajectory_zone_filter is None)
-    ):
+    if facial_expression_mode and facial_expression_zone_filter is None:
         camera_zones = await crud.list_zones(session, camera_id=camera_id)
     if facial_expression_mode and facial_expression_zone_filter is None:
         facial_expression_zone_filter = _zone_filter_from_zones(camera_zones)
-    if trajectory_heatmap_mode and trajectory_zone_filter is None:
-        trajectory_zone_filter = _zone_filter_from_zones(camera_zones)
 
     if zone is not None or entry_exit_mode or facial_expression_mode or trajectory_heatmap_mode or person_reid_mode:
         try:
@@ -674,6 +716,7 @@ async def latest_frame(
                         frame_token,
                         image,
                         facial_expression_zone_filter,
+                        non_blocking=True,
                     )
                     _draw_zone_polygons(cv2, image, facial_expression_zone_filter)
                     _draw_facial_expression_overlays(cv2, image, detections)
@@ -725,15 +768,10 @@ async def first_frame(
     camera_zones: list[Any] = []
     facial_expression_zone_filter = zone
     trajectory_zone_filter = zone
-    if (
-        (facial_expression_mode and facial_expression_zone_filter is None)
-        or (trajectory_heatmap_mode and trajectory_zone_filter is None)
-    ):
+    if facial_expression_mode and facial_expression_zone_filter is None:
         camera_zones = await crud.list_zones(session, camera_id=camera_id)
     if facial_expression_mode and facial_expression_zone_filter is None:
         facial_expression_zone_filter = _zone_filter_from_zones(camera_zones)
-    if trajectory_heatmap_mode and trajectory_zone_filter is None:
-        trajectory_zone_filter = _zone_filter_from_zones(camera_zones)
 
     if zone is not None or entry_exit_mode or facial_expression_mode or trajectory_heatmap_mode or person_reid_mode:
         try:
@@ -772,6 +810,7 @@ async def first_frame(
                         frame_token,
                         image,
                         facial_expression_zone_filter,
+                        non_blocking=True,
                     )
                     _draw_zone_polygons(cv2, image, facial_expression_zone_filter)
                     _draw_facial_expression_overlays(cv2, image, detections)
@@ -856,6 +895,7 @@ async def facial_expression_realtime(
                     frame_token,
                     image,
                     zone_filter,
+                    non_blocking=True,
                 )
         except Exception as exc:  # noqa: BLE001
             logger.debug("Facial realtime snapshot failed: %s", exc)
@@ -964,7 +1004,6 @@ async def mjpeg_stream(
         needs_camera_zones = (
             draw_entry_exit_lines
             or (draw_facial_expression and zone is None)
-            or (draw_trajectory_heatmap and zone is None)
         )
         camera_zones = await crud.list_zones(session, camera_id=camera_id) if needs_camera_zones else []
         zones = camera_zones if draw_entry_exit_lines else []
@@ -972,8 +1011,6 @@ async def mjpeg_stream(
         trajectory_zone_filter = zone
         if draw_facial_expression and facial_expression_zone_filter is None:
             facial_expression_zone_filter = _zone_filter_from_zones(camera_zones)
-        if draw_trajectory_heatmap and trajectory_zone_filter is None:
-            trajectory_zone_filter = _zone_filter_from_zones(camera_zones)
 
     if not camera:
         raise HTTPException(status_code=404, detail="Camera not found")
@@ -981,8 +1018,8 @@ async def mjpeg_stream(
     boundary = "frame"
     frame_interval_seconds = max(0.01, float(getattr(settings, "frame_interval_seconds", 0.04)))
     idle_wait_seconds = min(0.2, max(0.01, frame_interval_seconds))
-    same_token_wait_seconds = min(0.08, max(0.005, frame_interval_seconds / 2.0))
-    post_yield_wait_seconds = min(0.03, max(0.001, frame_interval_seconds * 0.8))
+    same_token_wait_seconds = min(0.04, max(0.005, frame_interval_seconds / 4.0))
+    post_yield_wait_seconds = min(0.01, max(0.001, frame_interval_seconds * 0.25))
 
     async def _stream():
         last_token = ""

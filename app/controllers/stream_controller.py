@@ -17,7 +17,8 @@ from app.db.models import StreamStatus
 from app.schemas import StreamRead, StreamStartRequest, StreamStatusRead, StreamStopRequest
 from app.services import runtime_config
 
-_INGESTION_STOP_TIMEOUT_SECONDS = 8.0
+_INGESTION_STOP_TIMEOUT_SECONDS = 3.0
+_INGESTION_FORCE_STOP_AFTER_SECONDS = 0.75
 _INGESTION_STOP_POLL_SECONDS = 0.1
 
 
@@ -225,8 +226,14 @@ async def _wait_for_ingestion_stop(ingestion_manager, stream_id: int) -> None:
     ingestion_manager.stop_ingestion(stream_id)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _INGESTION_STOP_TIMEOUT_SECONDS
+    force_stop_after = loop.time() + _INGESTION_FORCE_STOP_AFTER_SECONDS
+    forced = False
     while ingestion_manager.is_running(stream_id):
-        if loop.time() >= deadline:
+        now = loop.time()
+        if not forced and now >= force_stop_after:
+            ingestion_manager.force_stop_ingestion(stream_id)
+            forced = True
+        if now >= deadline:
             raise HTTPException(
                 status_code=503,
                 detail="Previous ingestion worker is still stopping. Retry in a few seconds.",

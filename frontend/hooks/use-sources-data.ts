@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   type Camera,
@@ -154,6 +154,7 @@ export function useSourcesData(options: Options = {}) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const realtimeRefreshRef = useRef<Promise<void> | null>(null);
 
   const refreshCore = useCallback(async () => {
     try {
@@ -167,14 +168,25 @@ export function useSourcesData(options: Options = {}) {
 
   const refreshRealtime = useCallback(async () => {
     if (!enableRealtime) return;
-    try {
-      const payload = await getRealtimeMonitoring();
-      setRealtime(payload.cameras);
-      setDetectorAvailable(payload.detector_available);
-      setAnalyticsRunning(payload.analytics_running);
-    } catch {
-      // Keep last successful realtime payload to avoid noisy UI on transient errors.
+    if (realtimeRefreshRef.current) {
+      return realtimeRefreshRef.current;
     }
+
+    const pending = (async () => {
+      try {
+        const payload = await getRealtimeMonitoring();
+        setRealtime(payload.cameras);
+        setDetectorAvailable(payload.detector_available);
+        setAnalyticsRunning(payload.analytics_running);
+      } catch {
+        // Keep last successful realtime payload to avoid noisy UI on transient errors.
+      } finally {
+        realtimeRefreshRef.current = null;
+      }
+    })();
+
+    realtimeRefreshRef.current = pending;
+    return pending;
   }, [enableRealtime]);
 
   useEffect(() => {
@@ -198,8 +210,12 @@ export function useSourcesData(options: Options = {}) {
   const refreshAll = useCallback(async () => {
     setBusy(true);
     setError("");
-    await Promise.all([refreshCore(), refreshRealtime()]);
-    setBusy(false);
+    try {
+      await refreshCore();
+      void refreshRealtime();
+    } finally {
+      setBusy(false);
+    }
   }, [refreshCore, refreshRealtime]);
 
   useEffect(() => {
@@ -300,7 +316,8 @@ export function useSourcesData(options: Options = {}) {
       } catch (err) {
         setError(toErrorMessage(err, "Failed to toggle stream"));
       } finally {
-        await Promise.all([refreshCore(), refreshRealtime()]);
+        await refreshCore();
+        void refreshRealtime();
         setBusy(false);
       }
     },
@@ -314,11 +331,15 @@ export function useSourcesData(options: Options = {}) {
       setNotice("");
       try {
         await deleteCamera(cameraId);
+        setCameras((previous) => previous.filter((camera) => camera.id !== cameraId));
+        setStreams((previous) => previous.filter((stream) => stream.camera_id !== cameraId));
+        setRealtime((previous) => previous.filter((snapshot) => snapshot.camera_id !== cameraId));
         setNotice(`Deleted camera #${cameraId}`);
       } catch (err) {
         setError(toErrorMessage(err, "Failed to delete source"));
       } finally {
-        await Promise.all([refreshCore(), refreshRealtime()]);
+        void refreshCore();
+        void refreshRealtime();
         setBusy(false);
       }
     },
@@ -399,7 +420,8 @@ export function useSourcesData(options: Options = {}) {
           setNotice(`Source #${camera.id} saved and stream started`);
         }
 
-        await Promise.all([refreshCore(), refreshRealtime()]);
+        await refreshCore();
+        void refreshRealtime();
         return camera;
       } catch (err) {
         setError(toErrorMessage(err, "Failed to save source"));
@@ -419,7 +441,7 @@ export function useSourcesData(options: Options = {}) {
       const state = await startAnalyticsRun();
       setAnalyticsRunning(state.running);
       setNotice("Analytics started");
-      await refreshRealtime();
+      void refreshRealtime();
     } catch (err) {
       setError(toErrorMessage(err, "Failed to start analytics"));
     } finally {
@@ -435,7 +457,7 @@ export function useSourcesData(options: Options = {}) {
       const state = await stopAnalyticsRun();
       setAnalyticsRunning(state.running);
       setNotice("Analytics stopped");
-      await refreshRealtime();
+      void refreshRealtime();
     } catch (err) {
       setError(toErrorMessage(err, "Failed to stop analytics"));
     } finally {

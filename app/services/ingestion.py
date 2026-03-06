@@ -8,19 +8,23 @@ import sys
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from queue import Queue
 from typing import Callable
 
+from sqlalchemy import update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.db import crud
-from app.db.models import FrameStatus
+from app.db.models import Frame, FrameStatus, Stream, StreamStatus
 
 logger = logging.getLogger(__name__)
+
+_MIN_CAPTURE_INTERVAL_SECONDS = 1.0
 
 
 @dataclass
@@ -43,6 +47,26 @@ class IngestionEntry:
     camera_id: int
     stop_event: threading.Event
     future: Future
+    process_ref: "_IngestionProcessRef"
+
+
+@dataclass
+class _IngestionProcessRef:
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    process: subprocess.Popen | None = None
+
+    def get(self) -> subprocess.Popen | None:
+        with self.lock:
+            return self.process
+
+    def set(self, process: subprocess.Popen | None) -> None:
+        with self.lock:
+            self.process = process
+
+    def clear(self, expected: subprocess.Popen | None = None) -> None:
+        with self.lock:
+            if expected is None or self.process is expected:
+                self.process = None
 
 
 class StreamIngestionManager:
@@ -63,6 +87,14 @@ class StreamIngestionManager:
             entries = list(self._jobs.values())
         for entry in entries:
             entry.stop_event.set()
+            process = entry.process_ref.get()
+            if process is not None and process.poll() is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    logger.debug("Failed to kill ffmpeg ingestion process during shutdown", exc_info=True)
         for entry in entries:
             entry.future.cancel()
         self._queue.put(None)
@@ -86,6 +118,7 @@ class StreamIngestionManager:
                 else:
                     return False
             stop_event = threading.Event()
+            process_ref = _IngestionProcessRef()
             future = self._executor.submit(
                 _run_ingestion,
                 stop_event,
@@ -94,24 +127,44 @@ class StreamIngestionManager:
                 camera_id,
                 source_kind,
                 source_value,
+                process_ref,
             )
             self._jobs[stream_id] = IngestionEntry(
                 stream_id=stream_id,
                 camera_id=camera_id,
                 stop_event=stop_event,
                 future=future,
+                process_ref=process_ref,
             )
         return True
 
     def stop_ingestion(self, stream_id: int) -> bool:
+        return self._signal_stop(stream_id, force=False)
+
+    def force_stop_ingestion(self, stream_id: int) -> bool:
+        return self._signal_stop(stream_id, force=True)
+
+    def _signal_stop(self, stream_id: int, *, force: bool) -> bool:
         with self._lock:
             entry = self._jobs.get(stream_id)
             if not entry:
                 return False
             entry.stop_event.set()
+        process = entry.process_ref.get()
+        if process is not None and process.poll() is None:
+            try:
+                if force:
+                    process.kill()
+                else:
+                    process.terminate()
+            except ProcessLookupError:
+                pass
+            except Exception:
+                logger.debug("Failed to signal ffmpeg ingestion process", exc_info=True)
+        with self._lock:
             if entry.future.done():
                 self._jobs.pop(stream_id, None)
-            return True
+        return True
 
     def is_running(self, stream_id: int) -> bool:
         with self._lock:
@@ -130,6 +183,7 @@ class StreamIngestionManager:
                     try:
                         await _handle_event(session, event)
                     except Exception:  # noqa: BLE001
+                        await session.rollback()
                         # Keep consumer alive even if a single event is invalid/stale.
                         logger.exception(
                             "Failed to process ingestion event kind=%s stream_id=%s camera_id=%s",
@@ -154,6 +208,7 @@ def _run_ingestion(
     camera_id: int,
     source_kind: str,
     source_value: str,
+    process_ref: _IngestionProcessRef,
 ) -> None:
     base_dir = Path(settings.frames_dir) / f"camera_{camera_id}" / f"stream_{stream_id}"
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -166,19 +221,23 @@ def _run_ingestion(
         except OSError:
             logger.warning("Failed to remove stale frame file: %s", stale_path)
 
-    fps_value = max(0.1, 1.0 / max(settings.frame_interval_seconds, 1e-6))
+    capture_interval_seconds = max(float(settings.frame_interval_seconds), _MIN_CAPTURE_INTERVAL_SECONDS)
+    fps_value = max(0.1, 1.0 / max(capture_interval_seconds, 1e-6))
     scan_sleep_seconds = max(
         0.005,
         min(
             0.25,
             float(settings.segment_scan_seconds),
-            max(float(settings.frame_interval_seconds), 0.005),
+            max(capture_interval_seconds, 0.005),
         ),
     )
+    emit_interval_seconds = capture_interval_seconds
     while not stop_event.is_set():
         run_prefix = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
         output_pattern = str(base_dir / f"{run_prefix}_%06d.jpg")
         next_frame_index = 0
+        last_emitted_monotonic = 0.0
+        pending_frame_signatures: dict[int, tuple[int, int]] = {}
         try:
             cmd = _build_ffmpeg_command(source_kind, source_value, fps_value, output_pattern)
         except ValueError as exc:
@@ -199,6 +258,7 @@ def _run_ingestion(
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            process_ref.set(process)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to start ffmpeg ingestion: %s", exc)
             queue.put(
@@ -213,51 +273,75 @@ def _run_ingestion(
             time.sleep(1.0)
             continue
 
-        while not stop_event.is_set():
-            if process.poll() is not None:
-                break
-
-            emitted_any = False
-            while True:
-                path = base_dir / f"{run_prefix}_{next_frame_index:06d}.jpg"
-                if not path.exists():
+        try:
+            while not stop_event.is_set():
+                if process.poll() is not None:
                     break
-                stat = path.stat()
-                timestamp = datetime.utcfromtimestamp(stat.st_mtime)
-                size_bytes = stat.st_size
-                queue.put(
-                    IngestionEvent(
-                        kind="frame",
-                        camera_id=camera_id,
-                        stream_id=stream_id,
-                        path=str(path),
-                        start_time=timestamp,
-                        end_time=timestamp,
-                        duration_seconds=0.0,
-                        size_bytes=size_bytes,
-                        status=FrameStatus.captured,
-                    )
+
+                emitted_any = False
+                latest_ready: tuple[Path, datetime, int] | None = None
+                while True:
+                    path = base_dir / f"{run_prefix}_{next_frame_index:06d}.jpg"
+                    if not path.exists():
+                        break
+                    stat = path.stat()
+                    if stat.st_size <= 0:
+                        # ffmpeg may create placeholder files before JPEG payload is fully flushed.
+                        break
+                    signature = (int(stat.st_size), int(stat.st_mtime_ns))
+                    if pending_frame_signatures.get(next_frame_index) != signature:
+                        pending_frame_signatures[next_frame_index] = signature
+                        # Require one stable scan before publishing the frame so the
+                        # dashboard never reads a half-written JPEG.
+                        break
+                    pending_frame_signatures.pop(next_frame_index, None)
+                    timestamp = datetime.utcfromtimestamp(stat.st_mtime)
+                    size_bytes = stat.st_size
+                    latest_ready = (path, timestamp, size_bytes)
+                    next_frame_index += 1
+
+                if latest_ready is not None:
+                    now_monotonic = time.monotonic()
+                    if (
+                        last_emitted_monotonic == 0.0
+                        or (now_monotonic - last_emitted_monotonic) >= emit_interval_seconds
+                    ):
+                        latest_path, timestamp, size_bytes = latest_ready
+                        queue.put(
+                            IngestionEvent(
+                                kind="frame",
+                                camera_id=camera_id,
+                                stream_id=stream_id,
+                                path=str(latest_path),
+                                start_time=timestamp,
+                                end_time=timestamp,
+                                duration_seconds=0.0,
+                                size_bytes=size_bytes,
+                                status=FrameStatus.captured,
+                            )
+                        )
+                        last_emitted_monotonic = now_monotonic
+                        emitted_any = True
+
+                if not emitted_any:
+                    time.sleep(scan_sleep_seconds)
+
+            if stop_event.is_set():
+                _terminate_process(process)
+                return
+
+            queue.put(
+                IngestionEvent(
+                    kind="status",
+                    camera_id=camera_id,
+                    stream_id=stream_id,
+                    status=FrameStatus.error,
+                    message="ffmpeg ingestion stopped; retrying",
                 )
-                next_frame_index += 1
-                emitted_any = True
-
-            if not emitted_any:
-                time.sleep(scan_sleep_seconds)
-
-        if stop_event.is_set():
-            _terminate_process(process)
-            return
-
-        queue.put(
-            IngestionEvent(
-                kind="status",
-                camera_id=camera_id,
-                stream_id=stream_id,
-                status=FrameStatus.error,
-                message="ffmpeg ingestion stopped; retrying",
             )
-        )
-        time.sleep(1.0)
+            time.sleep(1.0)
+        finally:
+            process_ref.clear(process)
 
 
 def _build_ffmpeg_command(
@@ -314,29 +398,43 @@ def _build_ffmpeg_command(
 
 
 def _terminate_process(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
     try:
         process.terminate()
-        process.wait(timeout=5)
+        process.wait(timeout=1.0)
     except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=5)
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=1.0)
     except Exception:
         logger.exception("Failed to terminate ffmpeg ingestion process")
 
 
 async def _handle_event(session: AsyncSession, event: IngestionEvent) -> None:
     if event.kind == "frame" and event.path:
-        stream = await crud.get_stream(session, event.stream_id)
-        stream_id = stream.id if stream else None
-        await crud.create_frame(
-            session=session,
+        frame = Frame(
             camera_id=event.camera_id,
-            stream_id=stream_id,
+            stream_id=event.stream_id,
             path=event.path,
             timestamp=event.start_time or datetime.utcnow(),
             width=None,
             height=None,
             size_bytes=event.size_bytes or 0,
+            status=FrameStatus.captured,
         )
-        if stream:
-            await crud.update_stream_heartbeat(session, stream, event.end_time or datetime.utcnow())
+        session.add(frame)
+        await session.execute(
+            update(Stream)
+            .where(Stream.id == event.stream_id)
+            .values(
+                last_heartbeat=event.end_time or datetime.utcnow(),
+                status=StreamStatus.running,
+            )
+        )
+        try:
+            await session.commit()
+        except IntegrityError:
+            # Duplicate paths or foreign-key races should not kill ingestion.
+            await session.rollback()
+        return

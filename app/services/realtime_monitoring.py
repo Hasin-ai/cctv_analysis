@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class _CacheEntry:
+    camera_id: int
     frame_path: str
     frame_mtime_ns: int
     zone_signature: tuple[tuple[int, str], ...]
@@ -24,6 +26,7 @@ class _CacheEntry:
     detection_boxes: list[dict[str, Any]]
     total_detected: int
     total_in_zones: int
+    updated_at_monotonic: float
 
 
 class RealtimeMonitoringService:
@@ -34,7 +37,8 @@ class RealtimeMonitoringService:
         self._cv2 = None
         self._np = None
         self._person_class_ids: list[int] = [0]
-        self._cache: _CacheEntry | None = None
+        self._cache: dict[tuple[int, tuple[tuple[int, str], ...]], _CacheEntry] = {}
+        self._inflight: set[tuple[int, tuple[tuple[int, str], ...]]] = set()
         self._lock = threading.Lock()
 
         if not self._use_yolo:
@@ -63,61 +67,94 @@ class RealtimeMonitoringService:
             and self._np is not None
         )
 
-    def count_people(self, frame_path: str, zones: list[Any]) -> dict[str, Any]:
+    def default_result(self, zones: list[Any], *, available: bool | None = None) -> dict[str, Any]:
         default_counts = {int(getattr(zone, "id", 0)): 0 for zone in zones}
+        return {
+            "available": self.is_available() if available is None else available,
+            "total_detected": 0,
+            "total_in_zones": 0,
+            "zone_counts": default_counts,
+            "detection_boxes": [],
+        }
+
+    def get_cached_result(
+        self,
+        camera_id: int,
+        frame_path: str,
+        zones: list[Any],
+    ) -> tuple[dict[str, Any], bool]:
         if not frame_path:
-            return {
-                "available": self.is_available(),
-                "total_detected": 0,
-                "total_in_zones": 0,
-                "zone_counts": default_counts,
-                "detection_boxes": [],
-            }
+            return self.default_result(zones), False
         if not self.is_available():
-            return {
-                "available": False,
-                "total_detected": 0,
-                "total_in_zones": 0,
-                "zone_counts": default_counts,
-                "detection_boxes": [],
-            }
+            return self.default_result(zones, available=False), False
 
         path = Path(frame_path)
         if not path.exists():
-            return {
-                "available": True,
-                "total_detected": 0,
-                "total_in_zones": 0,
-                "zone_counts": default_counts,
-                "detection_boxes": [],
-            }
+            return self.default_result(zones), False
 
         stat = path.stat()
         zone_signature = _zone_signature(zones)
-        cached = self._cache
-        if (
-            cached
-            and cached.frame_path == str(path)
-            and cached.frame_mtime_ns == stat.st_mtime_ns
-            and cached.zone_signature == zone_signature
-        ):
-            return {
-                "available": True,
-                "total_detected": cached.total_detected,
-                "total_in_zones": cached.total_in_zones,
-                "zone_counts": dict(cached.zone_counts),
-                "detection_boxes": [dict(box) for box in cached.detection_boxes],
-            }
+        cache_key = (camera_id, zone_signature)
+        with self._lock:
+            cached = self._cache.get(cache_key)
+            if (
+                cached
+                and cached.frame_path == str(path)
+                and cached.frame_mtime_ns == stat.st_mtime_ns
+            ):
+                return _result_from_cache(cached), False
+
+            fallback = _result_from_cache(cached) if cached else self.default_result(zones)
+            if cache_key in self._inflight:
+                return fallback, False
+
+            self._inflight.add(cache_key)
+        return fallback, True
+
+    def refresh_cached_result(
+        self,
+        camera_id: int,
+        frame_path: str,
+        zones: list[Any],
+    ) -> dict[str, Any]:
+        zone_signature = _zone_signature(zones)
+        cache_key = (camera_id, zone_signature)
+        try:
+            result = self.count_people(frame_path, zones)
+            path = Path(frame_path)
+            if path.exists() and result.get("available"):
+                stat = path.stat()
+                with self._lock:
+                    self._cache[cache_key] = _CacheEntry(
+                        camera_id=camera_id,
+                        frame_path=str(path),
+                        frame_mtime_ns=stat.st_mtime_ns,
+                        zone_signature=zone_signature,
+                        zone_counts=dict(result["zone_counts"]),
+                        detection_boxes=[dict(box) for box in result["detection_boxes"]],
+                        total_detected=int(result["total_detected"]),
+                        total_in_zones=int(result["total_in_zones"]),
+                        updated_at_monotonic=time.monotonic(),
+                    )
+                    self._prune_cache_locked(max_entries=32)
+            return result
+        finally:
+            with self._lock:
+                self._inflight.discard(cache_key)
+
+    def count_people(self, frame_path: str, zones: list[Any]) -> dict[str, Any]:
+        if not frame_path:
+            return self.default_result(zones)
+        if not self.is_available():
+            return self.default_result(zones, available=False)
+
+        path = Path(frame_path)
+        if not path.exists():
+            return self.default_result(zones)
 
         image = self._cv2.imread(str(path))
         if image is None:
-            return {
-                "available": True,
-                "total_detected": 0,
-                "total_in_zones": 0,
-                "zone_counts": default_counts,
-                "detection_boxes": [],
-            }
+            return self.default_result(zones)
 
         frame_h, frame_w = image.shape[:2]
         polygons = {
@@ -167,17 +204,6 @@ class RealtimeMonitoringService:
 
         total_in_zones = int(sum(zone_counts.values()))
         total_detected = total_in_zones
-        with self._lock:
-            self._cache = _CacheEntry(
-                frame_path=str(path),
-                frame_mtime_ns=stat.st_mtime_ns,
-                zone_signature=zone_signature,
-                zone_counts=dict(zone_counts),
-                detection_boxes=[dict(box) for box in detection_boxes],
-                total_detected=total_detected,
-                total_in_zones=total_in_zones,
-            )
-
         return {
             "available": True,
             "total_detected": total_detected,
@@ -185,6 +211,16 @@ class RealtimeMonitoringService:
             "zone_counts": zone_counts,
             "detection_boxes": detection_boxes,
         }
+
+    def _prune_cache_locked(self, *, max_entries: int) -> None:
+        if len(self._cache) <= max_entries:
+            return
+        stale_keys = sorted(
+            self._cache,
+            key=lambda key: self._cache[key].updated_at_monotonic,
+        )[: len(self._cache) - max_entries]
+        for key in stale_keys:
+            self._cache.pop(key, None)
 
 
 _service: RealtimeMonitoringService | None = None
@@ -204,6 +240,16 @@ def _zone_signature(zones: list[Any]) -> tuple[tuple[int, str], ...]:
         signature.append((int(getattr(zone, "id", 0)), polygon_signature))
     signature.sort(key=lambda item: item[0])
     return tuple(signature)
+
+
+def _result_from_cache(cached: _CacheEntry) -> dict[str, Any]:
+    return {
+        "available": True,
+        "total_detected": cached.total_detected,
+        "total_in_zones": cached.total_in_zones,
+        "zone_counts": dict(cached.zone_counts),
+        "detection_boxes": [dict(box) for box in cached.detection_boxes],
+    }
 
 
 def _resolve_zone_for_bbox(

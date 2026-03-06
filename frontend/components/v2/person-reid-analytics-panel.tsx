@@ -2,11 +2,12 @@
 
 import { useEffect, useState, useRef, useMemo } from "react";
 import { type AnalyzerJob, type AnalyzerStats, type AnalyzerTrack, getAnalyzerStats, getAnalyzerTracks, listAnalyzerJobs, createReconstruction, getReconstruction } from "@/lib/api";
+import { parseSelectedZoneId } from "@/lib/zone-selection";
 import { Loader2, RefreshCcw, User, Video, PlaySquare } from "lucide-react";
 
 export function PersonReidAnalyticsPanel({
   cameraId,
-  selectedZoneId = "all",
+  selectedZoneId = "",
 }: {
   cameraId: number;
   selectedZoneId?: string;
@@ -23,10 +24,7 @@ export function PersonReidAnalyticsPanel({
   const [generatingVideo, setGeneratingVideo] = useState(false);
   const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const facialExpressionZoneId = useMemo(() => {
-    if (selectedZoneId === "all") return null;
-    const parsed = Number(selectedZoneId);
-    if (!Number.isFinite(parsed) || parsed <= 0) return null;
-    return parsed;
+    return parseSelectedZoneId(selectedZoneId);
   }, [selectedZoneId]);
 
   useEffect(() => {

@@ -10,6 +10,7 @@ import {
   getQueueResult,
   runQueueAnalysis,
 } from "@/lib/api";
+import { parseSelectedZoneId } from "@/lib/zone-selection";
 import { MiniLineChart, StatTile } from "@/components/v2/ui";
 
 function pickBestQueueJob(jobs: QueueJob[]): QueueJob | null {
@@ -42,7 +43,7 @@ function isJobRecent(job: QueueJob): boolean {
 export function QueueAnalyticsPanel({
   cameraId,
   zones = [],
-  selectedZoneId = "all",
+  selectedZoneId = "",
 }: {
   cameraId: number;
   zones?: Zone[];
@@ -60,7 +61,7 @@ export function QueueAnalyticsPanel({
     triggerAttempted.current = true;
 
     try {
-      // Pick the first valid zone if "all" is selected
+      // Fall back to the first configured zone when no zone filter is selected.
       const targetZoneId = zoneId ?? zones[0]?.id;
       if (!targetZoneId) return;
 
@@ -90,8 +91,7 @@ export function QueueAnalyticsPanel({
 
     async function fetchData() {
       try {
-        const parsedZoneId = selectedZoneId !== "all" ? Number(selectedZoneId) : null;
-        const zoneId = parsedZoneId !== null && !Number.isNaN(parsedZoneId) ? parsedZoneId : null;
+        const zoneId = parseSelectedZoneId(selectedZoneId);
 
         // Fetch jobs scoped to the current camera and selected zone (if any).
         const jobs = await listQueueJobs(cameraId, zoneId ?? undefined);

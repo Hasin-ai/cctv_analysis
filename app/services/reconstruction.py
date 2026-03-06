@@ -309,8 +309,8 @@ def _concat_segments_with_overlay(segments: list[str], output: str, overlay_line
 
             try:
                 fps = float(capture.get(cv2.CAP_PROP_FPS))
-                if fps <= 0:
-                    fps = 25.0
+                if fps <= 1.0 or fps > 120.0:
+                    fps = _default_reconstruction_fps()
 
                 segment_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
                 segment_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -366,6 +366,7 @@ def _concat_frames(frames: list[tuple[str, datetime]], output: str) -> None:
         raise RuntimeError("No frame files found on disk for reconstruction")
 
     target_fps = _estimate_fps(ordered_frames)
+    min_frame_duration = 1.0 / max(target_fps, 1e-6)
     list_path = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as handle:
@@ -374,7 +375,7 @@ def _concat_frames(frames: list[tuple[str, datetime]], output: str) -> None:
                 handle.write(f"file '{_ffconcat_escape_path(path)}'\n")
                 if idx < len(ordered_frames) - 1:
                     next_ts = ordered_frames[idx + 1][1]
-                    duration = max((next_ts - timestamp).total_seconds(), 0.1)
+                    duration = max((next_ts - timestamp).total_seconds(), min_frame_duration)
                     handle.write(f"duration {duration}\n")
             # Concat demuxer requires the last entry again for the final duration.
             handle.write(f"file '{_ffconcat_escape_path(ordered_frames[-1][0])}'\n")
@@ -802,17 +803,36 @@ def _track_color(track_id: int) -> tuple[int, int, int]:
 
 
 def _estimate_fps(frames: list[tuple[str, datetime]]) -> float:
+    default_fps = _default_reconstruction_fps()
     if len(frames) < 2:
-        return 1.0
+        return default_fps
 
     deltas: list[float] = []
     for idx in range(len(frames) - 1):
         delta = (frames[idx + 1][1] - frames[idx][1]).total_seconds()
-        deltas.append(max(delta, 0.1))
+        if delta > 1e-6:
+            deltas.append(delta)
 
-    avg_delta = sum(deltas) / len(deltas) if deltas else 1.0
-    fps = 1.0 / max(avg_delta, 0.1)
-    return min(30.0, max(1.0, fps))
+    if not deltas:
+        return default_fps
+
+    sorted_deltas = sorted(deltas)
+    mid = len(sorted_deltas) // 2
+    if len(sorted_deltas) % 2 == 0:
+        median_delta = (sorted_deltas[mid - 1] + sorted_deltas[mid]) / 2.0
+    else:
+        median_delta = sorted_deltas[mid]
+
+    # Clamp timestamp jitter/outliers but preserve high-FPS streams.
+    clamped_delta = min(max(median_delta, 1.0 / 120.0), 1.0)
+    fps = 1.0 / clamped_delta
+    return min(60.0, max(1.0, fps))
+
+
+def _default_reconstruction_fps() -> float:
+    interval = max(1e-6, float(settings.frame_interval_seconds))
+    fps = 1.0 / interval
+    return min(60.0, max(1.0, fps))
 
 
 def _draw_zone_polygons_on_frame(cv2: Any, frame: Any, zone: Any) -> None:

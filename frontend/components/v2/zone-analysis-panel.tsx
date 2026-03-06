@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 
 import {
   type ZoneAnalysisResponse,
   getZoneAnalysis,
 } from "@/lib/api";
+import { parseSelectedZoneId } from "@/lib/zone-selection";
 import { StatTile } from "@/components/v2/ui";
 
 function toPercentText(value: number | null | undefined): string {
@@ -25,33 +26,9 @@ function staffRatioPercent(value: number): string {
   return `${Math.round(value * 100)}%`;
 }
 
-function HeatmapGrid({ normalizedGrid }: { normalizedGrid: number[][] }) {
-  const cells = normalizedGrid.flatMap((row, y) =>
-    row.map((value, x) => ({
-      key: `${y}-${x}`,
-      value: Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0,
-    }))
-  );
-
-  return (
-    <div className="grid grid-cols-12 gap-0.5 rounded border border-border/60 bg-white p-1">
-      {cells.map((cell) => (
-        <div
-          key={cell.key}
-          className="aspect-square rounded-[2px]"
-          style={{
-            backgroundColor: `rgba(14, 116, 144, ${0.08 + cell.value * 0.9})`,
-          }}
-          title={`Intensity: ${Math.round(cell.value * 100)}%`}
-        />
-      ))}
-    </div>
-  );
-}
-
 export function ZoneAnalysisPanel({
   cameraId,
-  selectedZoneId = "all",
+  selectedZoneId = "",
   start,
 }: {
   cameraId: number;
@@ -66,8 +43,7 @@ export function ZoneAnalysisPanel({
 
     async function load() {
       try {
-        const parsedZoneId = selectedZoneId !== "all" ? Number(selectedZoneId) : null;
-        const zoneId = parsedZoneId !== null && !Number.isNaN(parsedZoneId) ? parsedZoneId : undefined;
+        const zoneId = parseSelectedZoneId(selectedZoneId) ?? undefined;
         const payload = await getZoneAnalysis({
           cameraId,
           zoneId,
@@ -94,13 +70,6 @@ export function ZoneAnalysisPanel({
       window.clearInterval(id);
     };
   }, [cameraId, selectedZoneId, start]);
-
-  const topHeatmaps = useMemo(() => {
-    if (!data) return [];
-    return [...data.heatmaps]
-      .sort((a, b) => b.max_cell_count - a.max_cell_count)
-      .slice(0, 3);
-  }, [data]);
 
   if (loading && !data) {
     return <p className="text-sm text-muted-foreground">Loading zone analysis...</p>;
@@ -161,23 +130,6 @@ export function ZoneAnalysisPanel({
             )}
           </tbody>
         </table>
-      </div>
-
-      <div className="grid gap-3 lg:grid-cols-3">
-        {topHeatmaps.length === 0 ? (
-          <div className="rounded-xl border border-border/70 bg-white/80 p-3 text-xs text-muted-foreground">
-            No zone heatmaps available yet.
-          </div>
-        ) : (
-          topHeatmaps.map((heatmap) => (
-            <div key={heatmap.zone_id} className="rounded-xl border border-border/70 bg-white/80 p-3">
-              <p className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">
-                Heatmap: {heatmap.zone_name}
-              </p>
-              <HeatmapGrid normalizedGrid={heatmap.normalized_grid} />
-            </div>
-          ))
-        )}
       </div>
 
       <div className="grid gap-3 lg:grid-cols-2">
