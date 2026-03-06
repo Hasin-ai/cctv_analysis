@@ -40,6 +40,7 @@ frontend/.cache/
 *.log
 *.pid
 data/app.db
+data/app.db-journal
 data/frames/
 data/segments/
 data/reconstructions/
