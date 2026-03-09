@@ -10,6 +10,7 @@ import {
   getQueueResult,
   runQueueAnalysis,
 } from "@/lib/api";
+import { usePageVisibility } from "@/hooks/use-page-visibility";
 import { parseSelectedZoneId } from "@/lib/zone-selection";
 import { MiniLineChart, StatTile } from "@/components/v2/ui";
 
@@ -53,6 +54,7 @@ export function QueueAnalyticsPanel({
   const [latestStatus, setLatestStatus] = useState<string | null>(null);
   const [showingHistoricalResult, setShowingHistoricalResult] = useState(false);
   const [loading, setLoading] = useState(true);
+  const isPageVisible = usePageVisibility();
   const triggerAttempted = useRef(false);
 
   /** Auto-trigger a queue analysis for the selected zone */
@@ -86,6 +88,7 @@ export function QueueAnalyticsPanel({
   }, [cameraId, zones]);
 
   useEffect(() => {
+    if (!isPageVisible) return undefined;
     let active = true;
     triggerAttempted.current = false;
 
@@ -147,7 +150,7 @@ export function QueueAnalyticsPanel({
       active = false;
       clearInterval(id);
     };
-  }, [cameraId, selectedZoneId, autoTriggerJob]);
+  }, [autoTriggerJob, cameraId, isPageVisible, selectedZoneId]);
 
   const zone = useMemo(() => {
     if (!queueData) return null;

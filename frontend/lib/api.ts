@@ -440,6 +440,10 @@ export type ReconstructionJob = {
   updated_at: string;
 };
 
+export type RuntimeConfigResponse = {
+  config: Record<string, unknown>;
+};
+
 function withQuery(path: string, query: Record<string, string | number | null | undefined>): string {
   const params = new URLSearchParams();
   Object.entries(query).forEach(([key, value]) => {
@@ -487,6 +491,17 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export async function getHealth() {
   return request<{ status: string }>("/health");
+}
+
+export async function getRuntimeConfig() {
+  return request<RuntimeConfigResponse>("/api/config");
+}
+
+export async function updateRuntimeConfig(key: string, value: unknown) {
+  return request<RuntimeConfigResponse>("/api/config", {
+    method: "PUT",
+    body: JSON.stringify({ key, value }),
+  });
 }
 
 export async function listCameras() {
@@ -745,6 +760,7 @@ export async function createReconstruction(payload: {
   draw_tracking?: boolean;
   draw_facial_expression?: boolean;
   facial_expression_zone_id?: number | null;
+  output_fps?: number | null;
 }) {
   return request<ReconstructionJob>("/api/reconstructions", {
     method: "POST",

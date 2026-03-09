@@ -32,16 +32,20 @@ def crop_image_to_zone(
         if not polygon:
             return image
 
-        points = region_points_from_polygon(
+        polygons = region_points_from_polygon(
             polygon,
             frame_w,
             frame_h,
             use_default_on_invalid=False,
         )
-        if len(points) < 3:
+        if not polygons:
             return image
 
-        arr = np.array(points, dtype=np.int32)
+        all_points = [point for poly in polygons if len(poly) >= 3 for point in poly]
+        if len(all_points) < 3:
+            return image
+
+        arr = np.array(all_points, dtype=np.int32)
         x, y, w, h = cv2.boundingRect(arr)
         
         # Add a tiny bit of padding if possible, keeping within bounds
@@ -59,4 +63,3 @@ def crop_image_to_zone(
     except Exception:
         # Avoid crashing the stream if something goes wrong with cropping
         return image
-

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useRef, useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { type AnalyzerJob, type AnalyzerStats, type AnalyzerTrack, getAnalyzerStats, getAnalyzerTracks, listAnalyzerJobs, createReconstruction, getReconstruction } from "@/lib/api";
 import { parseSelectedZoneId } from "@/lib/zone-selection";
 import { Loader2, RefreshCcw, User, Video, PlaySquare } from "lucide-react";
@@ -23,9 +23,31 @@ export function PersonReidAnalyticsPanel({
   const [reconstructionVideoUrl, setReconstructionVideoUrl] = useState<string | null>(null);
   const [generatingVideo, setGeneratingVideo] = useState(false);
   const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const retryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const [videoReloadNonce, setVideoReloadNonce] = useState(0);
+  const [videoReady, setVideoReady] = useState(false);
   const facialExpressionZoneId = useMemo(() => {
     return parseSelectedZoneId(selectedZoneId);
   }, [selectedZoneId]);
+  const playbackUrl = useMemo(() => {
+    if (!reconstructionVideoUrl) return null;
+    const separator = reconstructionVideoUrl.includes("?") ? "&" : "?";
+    return `${reconstructionVideoUrl}${separator}v=${videoReloadNonce}`;
+  }, [reconstructionVideoUrl, videoReloadNonce]);
+
+  useEffect(() => {
+    return () => {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+        pollIntervalRef.current = null;
+      }
+      if (retryTimeoutRef.current) {
+        clearTimeout(retryTimeoutRef.current);
+        retryTimeoutRef.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -60,9 +82,15 @@ export function PersonReidAnalyticsPanel({
     setReconstructionStatus(null);
     setReconstructionVideoUrl(null);
     setGeneratingVideo(false);
+    setVideoReloadNonce(0);
+    setVideoReady(false);
     if (pollIntervalRef.current) {
       clearInterval(pollIntervalRef.current);
       pollIntervalRef.current = null;
+    }
+    if (retryTimeoutRef.current) {
+      clearTimeout(retryTimeoutRef.current);
+      retryTimeoutRef.current = null;
     }
 
     async function fetchDetails() {
@@ -92,6 +120,12 @@ export function PersonReidAnalyticsPanel({
       setGeneratingVideo(true);
       setReconstructionStatus("Starting generation...");
       setReconstructionVideoUrl(null);
+      setVideoReloadNonce(0);
+      setVideoReady(false);
+      if (retryTimeoutRef.current) {
+        clearTimeout(retryTimeoutRef.current);
+        retryTimeoutRef.current = null;
+      }
       
       const job = await createReconstruction({
         camera_id: cameraId,
@@ -101,6 +135,7 @@ export function PersonReidAnalyticsPanel({
         draw_tracking: true,
         draw_facial_expression: true,
         facial_expression_zone_id: facialExpressionZoneId,
+        output_fps: 30,
       });
 
       pollIntervalRef.current = setInterval(async () => {
@@ -109,10 +144,13 @@ export function PersonReidAnalyticsPanel({
           setReconstructionStatus(`Generation Status: ${statusResult.status}`);
           if (statusResult.status === "completed") {
             if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+            pollIntervalRef.current = null;
+            setReconstructionStatus("Generation Status: completed");
             setReconstructionVideoUrl(`/api/backend/api/reconstructions/${job.id}/download`);
             setGeneratingVideo(false);
           } else if (statusResult.status === "failed") {
             if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+            pollIntervalRef.current = null;
             setReconstructionStatus(`Failed to generate video: ${statusResult.error || "Unknown error"}`);
             setGeneratingVideo(false);
           }
@@ -125,6 +163,57 @@ export function PersonReidAnalyticsPanel({
       setReconstructionStatus(err instanceof Error ? err.message : "Failed to submit reconstruction job");
       setGeneratingVideo(false);
     }
+  };
+
+  useEffect(() => {
+    if (!playbackUrl) return;
+    const video = videoRef.current;
+    if (!video) return;
+
+    setVideoReady(false);
+    video.pause();
+    video.currentTime = 0;
+    video.load();
+
+    const playPromise = video.play();
+    if (playPromise && typeof playPromise.catch === "function") {
+      void playPromise.catch(() => {
+        // Muted autoplay should usually work, but keep controls available if the browser declines.
+      });
+    }
+  }, [playbackUrl]);
+
+  const handleVideoReady = () => {
+    setVideoReady(true);
+    if (retryTimeoutRef.current) {
+      clearTimeout(retryTimeoutRef.current);
+      retryTimeoutRef.current = null;
+    }
+    const video = videoRef.current;
+    if (!video) return;
+    const playPromise = video.play();
+    if (playPromise && typeof playPromise.catch === "function") {
+      void playPromise.catch(() => {
+        // Keep the player interactive even if autoplay is rejected.
+      });
+    }
+  };
+
+  const handleVideoError = () => {
+    setVideoReady(false);
+    if (!reconstructionVideoUrl) return;
+    if (videoReloadNonce >= 3) {
+      setReconstructionStatus("Output video is ready but the browser could not load it automatically. Use the controls to retry.");
+      return;
+    }
+
+    setReconstructionStatus("Finalizing output video...");
+    if (retryTimeoutRef.current) {
+      clearTimeout(retryTimeoutRef.current);
+    }
+    retryTimeoutRef.current = setTimeout(() => {
+      setVideoReloadNonce((value) => value + 1);
+    }, 800);
   };
 
   if (loading && !stats) {
@@ -207,21 +296,37 @@ export function PersonReidAnalyticsPanel({
             <PlaySquare className="w-5 h-5 text-indigo-600" />
             <span className="text-sm font-semibold text-indigo-900">Trajectory Video</span>
             {generatingVideo && <Loader2 className="w-4 h-4 text-indigo-600 animate-spin ml-2" />}
-            {reconstructionStatus && !reconstructionVideoUrl && (
+            {reconstructionStatus && (!playbackUrl || !videoReady) && (
               <span className="text-xs font-medium text-indigo-700 ml-2">{reconstructionStatus}</span>
             )}
           </div>
           
-          {reconstructionVideoUrl && (
-            <div className="rounded-lg overflow-hidden border border-indigo-100 bg-black aspect-video flex">
-              <video 
-                src={reconstructionVideoUrl} 
-                controls 
+          {playbackUrl && (
+            <div className="relative flex aspect-video overflow-hidden rounded-lg border border-indigo-100 bg-black">
+              <video
+                key={playbackUrl}
+                ref={videoRef}
+                src={playbackUrl}
+                controls
                 autoPlay
-                className="w-full h-full object-contain"
+                muted
+                playsInline
+                preload="auto"
+                className="h-full w-full object-contain"
+                onLoadedData={handleVideoReady}
+                onCanPlay={handleVideoReady}
+                onError={handleVideoError}
               >
                 Your browser does not support the video tag.
               </video>
+              {!videoReady ? (
+                <div className="absolute inset-0 grid place-items-center bg-black/35">
+                  <div className="flex items-center gap-2 rounded-md bg-slate-900/80 px-3 py-2 text-xs font-medium text-slate-100">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Preparing video playback...
+                  </div>
+                </div>
+              ) : null}
             </div>
           )}
         </div>

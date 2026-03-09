@@ -14,6 +14,7 @@ from app.core.config import settings
 from app.db import crud
 from app.db.models import ReconstructionStatus
 from app.services.facial_expression_recognition import FacialExpressionRecognitionService
+from app.services.zone_geometry import region_points_from_polygon
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,7 @@ class ReconstructionService:
         draw_tracking: bool = False,
         draw_facial_expression: bool = False,
         facial_expression_zone_id: int | None = None,
+        output_fps: float | None = None,
     ) -> None:
         if job_id in self._tasks:
             return
@@ -71,6 +73,7 @@ class ReconstructionService:
                 draw_tracking=draw_tracking,
                 draw_facial_expression=draw_facial_expression,
                 facial_expression_zone_id=facial_expression_zone_id,
+                output_fps=output_fps,
             )
         )
         self._tasks[job_id] = task
@@ -83,6 +86,7 @@ class ReconstructionService:
         draw_tracking: bool,
         draw_facial_expression: bool,
         facial_expression_zone_id: int | None,
+        output_fps: float | None,
     ) -> None:
         sanitized_overlay_lines = _sanitize_overlay_lines(overlay_lines)
         async with self._session_factory() as session:
@@ -205,6 +209,7 @@ class ReconstructionService:
                     frame_detections=tracking_by_frame_id,
                     facial_expression_service=facial_expression_service,
                     facial_expression_zone=facial_expression_zone,
+                    output_fps=output_fps,
                 )
             elif segments:
                 if sanitized_overlay_lines:
@@ -213,10 +218,14 @@ class ReconstructionService:
                         segments=[s.path for s in segments],
                         output=str(output_path),
                         overlay_lines=sanitized_overlay_lines,
+                        output_fps=output_fps,
                     )
                 else:
                     await asyncio.to_thread(
-                        _concat_segments, segments=[s.path for s in segments], output=str(output_path)
+                        _concat_segments,
+                        segments=[s.path for s in segments],
+                        output=str(output_path),
+                        output_fps=output_fps,
                     )
             else:
                 if sanitized_overlay_lines:
@@ -225,12 +234,14 @@ class ReconstructionService:
                         frames=[(frame.path, frame.timestamp, frame.id) for frame in frames],
                         output=str(output_path),
                         overlay_lines=sanitized_overlay_lines,
+                        output_fps=output_fps,
                     )
                 else:
                     await asyncio.to_thread(
                         _concat_frames,
                         frames=[(frame.path, frame.timestamp) for frame in frames],
                         output=str(output_path),
+                        output_fps=output_fps,
                     )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Reconstruction failed: %s", exc)
@@ -256,7 +267,7 @@ class ReconstructionService:
                 )
 
 
-def _concat_segments(segments: list[str], output: str) -> None:
+def _concat_segments(segments: list[str], output: str, output_fps: float | None = None) -> None:
     list_path = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as handle:
@@ -264,6 +275,7 @@ def _concat_segments(segments: list[str], output: str) -> None:
                 handle.write(f"file '{_ffconcat_escape_path(segment)}'\n")
             list_path = handle.name
 
+        target_output_fps = _normalize_output_fps(output_fps)
         cmd = [
             settings.ffmpeg_path,
             "-hide_banner",
@@ -276,10 +288,25 @@ def _concat_segments(segments: list[str], output: str) -> None:
             "0",
             "-i",
             list_path,
-            "-c",
-            "copy",
-            output,
         ]
+        if target_output_fps is None:
+            cmd.extend(["-c", "copy", output])
+        else:
+            cmd.extend(
+                [
+                    "-vf",
+                    _video_filter_chain(target_output_fps),
+                    "-vsync",
+                    "cfr",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:v",
+                    "libx264",
+                    "-movflags",
+                    "+faststart",
+                    output,
+                ]
+            )
 
         _run_ffmpeg(cmd, "FFmpeg concat failed")
     finally:
@@ -287,7 +314,12 @@ def _concat_segments(segments: list[str], output: str) -> None:
             Path(list_path).unlink(missing_ok=True)
 
 
-def _concat_segments_with_overlay(segments: list[str], output: str, overlay_lines: list[str]) -> None:
+def _concat_segments_with_overlay(
+    segments: list[str],
+    output: str,
+    overlay_lines: list[str],
+    output_fps: float | None = None,
+) -> None:
     cv2 = _load_cv2()
     ordered_segments = [segment for segment in segments if Path(segment).exists()]
     if not ordered_segments:
@@ -348,6 +380,7 @@ def _concat_segments_with_overlay(segments: list[str], output: str, overlay_line
             source_path=raw_output_path,
             output=output,
             error_prefix="FFmpeg segment overlay transcode failed",
+            output_fps=output_fps,
         )
     finally:
         if writer is not None:
@@ -356,7 +389,11 @@ def _concat_segments_with_overlay(segments: list[str], output: str, overlay_line
             Path(raw_output_path).unlink(missing_ok=True)
 
 
-def _concat_frames(frames: list[tuple[str, datetime]], output: str) -> None:
+def _concat_frames(
+    frames: list[tuple[str, datetime]],
+    output: str,
+    output_fps: float | None = None,
+) -> None:
     if not frames:
         raise RuntimeError("No frames available to reconstruct")
 
@@ -365,8 +402,9 @@ def _concat_frames(frames: list[tuple[str, datetime]], output: str) -> None:
     if not ordered_frames:
         raise RuntimeError("No frame files found on disk for reconstruction")
 
-    target_fps = _estimate_fps(ordered_frames)
-    min_frame_duration = 1.0 / max(target_fps, 1e-6)
+    source_fps = _estimate_fps(ordered_frames)
+    target_output_fps = _normalize_output_fps(output_fps)
+    min_frame_duration = 1.0 / max(source_fps, 1e-6)
     list_path = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as handle:
@@ -393,24 +431,42 @@ def _concat_frames(frames: list[tuple[str, datetime]], output: str) -> None:
             "0",
             "-i",
             list_path,
-            "-vf",
-            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-            "-vsync",
-            "vfr",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:v",
-            "libx264",
-            "-movflags",
-            "+faststart",
-            output,
         ]
+        if target_output_fps is not None:
+            cmd.extend(
+                [
+                    "-vf",
+                    _video_filter_chain(target_output_fps),
+                    "-vsync",
+                    "cfr",
+                ]
+            )
+        else:
+            cmd.extend(
+                [
+                    "-vf",
+                    _video_filter_chain(None),
+                    "-vsync",
+                    "vfr",
+                ]
+            )
+        cmd.extend(
+            [
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-movflags",
+                "+faststart",
+                output,
+            ]
+        )
 
         try:
             _run_ffmpeg(cmd, "FFmpeg frame concat failed")
         except RuntimeError as exc:
             logger.warning("%s. Retrying with image-sequence fallback.", exc)
-            _concat_frames_fallback(ordered_frames, output, target_fps)
+            _concat_frames_fallback(ordered_frames, output, source_fps, output_fps=target_output_fps)
     finally:
         if list_path:
             Path(list_path).unlink(missing_ok=True)
@@ -423,6 +479,7 @@ def _concat_frames_with_overlay(
     frame_detections: dict[int, list[dict]] | None = None,
     facial_expression_service: FacialExpressionRecognitionService | None = None,
     facial_expression_zone: Any | None = None,
+    output_fps: float | None = None,
 ) -> None:
     if not frames:
         raise RuntimeError("No frames available to reconstruct")
@@ -438,6 +495,8 @@ def _concat_frames_with_overlay(
         overlay_frames: list[tuple[str, datetime]] = []
         track_trails: dict[int, list[tuple[int, int]]] = {}
         track_last_seen: dict[int, int] = {}
+        facial_expression_polygons: list[list[tuple[int, int]]] | None = None
+        facial_expression_polygon_dims: tuple[int, int] | None = None
 
         for idx, (source_path, timestamp, frame_id) in enumerate(ordered_frames, start=1):
             image = cv2.imread(source_path)
@@ -456,12 +515,28 @@ def _concat_frames_with_overlay(
                 )
 
             if facial_expression_service is not None and facial_expression_service.is_available():
+                frame_h, frame_w = image.shape[:2]
+                polygon_dims = (frame_w, frame_h)
+                if facial_expression_zone is not None and facial_expression_polygon_dims != polygon_dims:
+                    facial_expression_polygons = region_points_from_polygon(
+                        getattr(facial_expression_zone, "polygon", None),
+                        frame_w,
+                        frame_h,
+                        use_default_on_invalid=False,
+                    )
+                    facial_expression_polygon_dims = polygon_dims
                 facial_detections = facial_expression_service.detect_faces_with_demographics(
                     image,
                     zone=facial_expression_zone,
+                    precomputed_polygons=facial_expression_polygons,
                 )
                 _draw_facial_expression_boxes(cv2, image, facial_detections)
-                _draw_zone_polygons_on_frame(cv2, image, facial_expression_zone)
+                _draw_zone_polygons_on_frame(
+                    cv2,
+                    image,
+                    facial_expression_zone,
+                    precomputed_polygons=facial_expression_polygons,
+                )
 
             _draw_overlay_box(cv2, image, overlay_lines)
             rendered_path = tmp_path / f"overlay_{idx:06d}.jpg"
@@ -472,10 +547,14 @@ def _concat_frames_with_overlay(
         if not overlay_frames:
             raise RuntimeError("No valid frames were available for overlay rendering")
 
-        _concat_frames(overlay_frames, output)
+        _concat_frames(overlay_frames, output, output_fps=output_fps)
 
-
-def _concat_frames_fallback(frames: list[tuple[str, datetime]], output: str, fps: float) -> None:
+def _concat_frames_fallback(
+    frames: list[tuple[str, datetime]],
+    output: str,
+    source_fps: float,
+    output_fps: float | None = None,
+) -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
         for idx, (source, _) in enumerate(frames, start=1):
@@ -493,23 +572,31 @@ def _concat_frames_fallback(frames: list[tuple[str, datetime]], output: str, fps
             settings.ffmpeg_log_level,
             "-y",
             "-framerate",
-            f"{fps:.3f}",
+            f"{source_fps:.3f}",
             "-i",
             str(tmp_path / "frame_%06d.jpg"),
-            "-vf",
-            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:v",
-            "libx264",
-            "-movflags",
-            "+faststart",
-            output,
         ]
+        cmd.extend(
+            [
+                "-vf",
+                _video_filter_chain(output_fps),
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-movflags",
+                "+faststart",
+                output,
+            ]
+        )
         _run_ffmpeg(cmd, "FFmpeg frame fallback concat failed")
 
-
-def _transcode_for_playback(source_path: str, output: str, error_prefix: str) -> None:
+def _transcode_for_playback(
+    source_path: str,
+    output: str,
+    error_prefix: str,
+    output_fps: float | None = None,
+) -> None:
     cmd = [
         settings.ffmpeg_path,
         "-hide_banner",
@@ -518,16 +605,23 @@ def _transcode_for_playback(source_path: str, output: str, error_prefix: str) ->
         "-y",
         "-i",
         source_path,
-        "-vf",
-        "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:v",
-        "libx264",
-        "-movflags",
-        "+faststart",
-        output,
     ]
+    normalized_output_fps = _normalize_output_fps(output_fps)
+    if normalized_output_fps is not None:
+        cmd.extend(["-vf", _video_filter_chain(normalized_output_fps), "-vsync", "cfr"])
+    else:
+        cmd.extend(["-vf", _video_filter_chain(None)])
+    cmd.extend(
+        [
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            "-movflags",
+            "+faststart",
+            output,
+        ]
+    )
     _run_ffmpeg(cmd, error_prefix)
 
 
@@ -571,6 +665,26 @@ def _sanitize_overlay_lines(lines: list[str] | None) -> list[str]:
         if len(sanitized) >= 8:
             break
     return sanitized
+
+
+def _normalize_output_fps(output_fps: float | None) -> float | None:
+    if output_fps is None:
+        return None
+    try:
+        normalized = float(output_fps)
+    except (TypeError, ValueError):
+        return None
+    if normalized <= 0:
+        return None
+    return min(60.0, max(1.0, normalized))
+
+
+def _video_filter_chain(output_fps: float | None) -> str:
+    filters = ["scale=trunc(iw/2)*2:trunc(ih/2)*2"]
+    normalized_output_fps = _normalize_output_fps(output_fps)
+    if normalized_output_fps is not None:
+        filters.append(f"fps={normalized_output_fps:.3f}")
+    return ",".join(filters)
 
 
 def _even_dimensions(width: int, height: int) -> tuple[int, int]:
@@ -835,7 +949,12 @@ def _default_reconstruction_fps() -> float:
     return min(60.0, max(1.0, fps))
 
 
-def _draw_zone_polygons_on_frame(cv2: Any, frame: Any, zone: Any) -> None:
+def _draw_zone_polygons_on_frame(
+    cv2: Any,
+    frame: Any,
+    zone: Any,
+    precomputed_polygons: list[list[tuple[int, int]]] | None = None,
+) -> None:
     """Draw zone polygon boundary/boundaries onto a video frame for facial expression mode."""
     if zone is None:
         return
@@ -847,12 +966,14 @@ def _draw_zone_polygons_on_frame(cv2: Any, frame: Any, zone: Any) -> None:
         if frame_w <= 0 or frame_h <= 0:
             return
 
-        polygons = region_points_from_polygon(
-            getattr(zone, "polygon", None),
-            frame_w,
-            frame_h,
-            use_default_on_invalid=False,
-        )
+        polygons = precomputed_polygons
+        if polygons is None:
+            polygons = region_points_from_polygon(
+                getattr(zone, "polygon", None),
+                frame_w,
+                frame_h,
+                use_default_on_invalid=False,
+            )
         if not polygons:
             return
 

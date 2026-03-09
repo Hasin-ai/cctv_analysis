@@ -6,6 +6,7 @@ import {
   type ZoneAnalysisResponse,
   getZoneAnalysis,
 } from "@/lib/api";
+import { usePageVisibility } from "@/hooks/use-page-visibility";
 import { parseSelectedZoneId } from "@/lib/zone-selection";
 import { StatTile } from "@/components/v2/ui";
 
@@ -37,8 +38,10 @@ export function ZoneAnalysisPanel({
 }) {
   const [data, setData] = useState<ZoneAnalysisResponse | null>(null);
   const [loading, setLoading] = useState(true);
+  const isPageVisible = usePageVisibility();
 
   useEffect(() => {
+    if (!isPageVisible) return undefined;
     let active = true;
 
     async function load() {
@@ -69,7 +72,7 @@ export function ZoneAnalysisPanel({
       active = false;
       window.clearInterval(id);
     };
-  }, [cameraId, selectedZoneId, start]);
+  }, [cameraId, isPageVisible, selectedZoneId, start]);
 
   if (loading && !data) {
     return <p className="text-sm text-muted-foreground">Loading zone analysis...</p>;

@@ -25,6 +25,17 @@ export const ANALYTICS_MODES: Array<{ id: AnalyticsMode; label: string }> = [
   { id: "person_reid", label: "Person ReID" },
 ];
 
+function backendAnalyticsMode(mode: AnalyticsMode): AnalyticsMode | null {
+  if (mode === "trajectory_heatmap" || mode === "facial_expression" || mode === "person_reid") {
+    return mode;
+  }
+  return null;
+}
+
+function shouldUseBackendZoneFilter(mode: AnalyticsMode): boolean {
+  return mode === "trajectory_heatmap" || mode === "facial_expression" || mode === "person_reid";
+}
+
 function readZonePolygons(zone: Zone): Array<Array<{ x: number; y: number }>> {
   const evaluatePoints = (pts: unknown) => {
     if (!Array.isArray(pts)) return [];
@@ -183,38 +194,45 @@ export function CameraFeed({
   compact?: boolean;
   staticFirstFrame?: boolean;
   zoneId?: string;
-  analyticsMode?: AnalyticsMode;
+  analyticsMode?: AnalyticsMode | null;
 }) {
   const [streamErrored, setStreamErrored] = useState(false);
   const [streamReady, setStreamReady] = useState(false);
   const [snapshotTick, setSnapshotTick] = useState(0);
   const [streamNonce, setStreamNonce] = useState(0);
 
-  const analyticsModeParam = analyticsMode ?? "person_count";
+  const activeAnalyticsMode = analyticsMode ?? null;
+  const analyticsModeParam = activeAnalyticsMode ? backendAnalyticsMode(activeAnalyticsMode) : null;
   const hasZoneFilter = isZoneFilterSelected(zoneId);
   const filteredZoneId = hasZoneFilter ? zoneId ?? "" : "";
+  const backendZoneFilter =
+    hasZoneFilter && activeAnalyticsMode && shouldUseBackendZoneFilter(activeAnalyticsMode) ? filteredZoneId : "";
+  const selectedZoneNumber = hasZoneFilter ? Number(filteredZoneId) : null;
 
   const streamUrlBase = `/api/stream/cameras/${cameraId}/stream.mjpg`;
   const streamParams = new URLSearchParams({
     v: String(streamNonce),
-    analytics_mode: analyticsModeParam,
   });
-  if (hasZoneFilter) {
-    streamParams.set("zone_id", filteredZoneId);
+  if (analyticsModeParam) {
+    streamParams.set("analytics_mode", analyticsModeParam);
+  }
+  if (backendZoneFilter) {
+    streamParams.set("zone_id", backendZoneFilter);
   }
   const streamUrl = `${streamUrlBase}?${streamParams.toString()}`;
 
   const snapshotUrlBase = staticFirstFrame
     ? `/api/backend/api/monitoring/cameras/${cameraId}/first-frame`
     : `/api/backend/api/monitoring/cameras/${cameraId}/frame`;
-  const snapshotParams = new URLSearchParams({
-    analytics_mode: analyticsModeParam,
-  });
+  const snapshotParams = new URLSearchParams();
+  if (analyticsModeParam) {
+    snapshotParams.set("analytics_mode", analyticsModeParam);
+  }
   if (!staticFirstFrame) {
     snapshotParams.set("t", String(snapshotTick));
   }
-  if (hasZoneFilter) {
-    snapshotParams.set("zone_id", filteredZoneId);
+  if (backendZoneFilter) {
+    snapshotParams.set("zone_id", backendZoneFilter);
   }
   const snapshotUrl = `${snapshotUrlBase}?${snapshotParams.toString()}`;
   const parsedZones = useMemo(
@@ -243,6 +261,9 @@ export function CameraFeed({
     () =>
       detectionBoxes
         .map((box, index) => {
+          if (selectedZoneNumber !== null && Number(box.zone_id) !== selectedZoneNumber) {
+            return null;
+          }
           const x1 = Number(box.x1);
           const y1 = Number(box.y1);
           const x2 = Number(box.x2);
@@ -278,7 +299,7 @@ export function CameraFeed({
             inZone: boolean;
           } => box !== null,
         ),
-    [detectionBoxes],
+    [detectionBoxes, selectedZoneNumber],
   );
 
   const streamLoadedRef = useRef(false);
@@ -291,16 +312,13 @@ export function CameraFeed({
   // its first frame, otherwise the panel goes blank during connect/reconnect.
   const showSnapshot = staticFirstFrame || !showStream || !streamReady;
   const showFallbackBackground = false;
-  const showFrontendPersonBoxes =
-    analyticsModeParam !== "entry_exit_count" &&
-    analyticsModeParam !== "facial_expression" &&
-    analyticsModeParam !== "trajectory_heatmap" &&
-    analyticsModeParam !== "person_reid";
+  const showFrontendPersonBoxes = activeAnalyticsMode === "person_count" || activeAnalyticsMode === "queue";
   const showFrontendZones =
-    analyticsModeParam !== "facial_expression" &&
-    analyticsModeParam !== "trajectory_heatmap" &&
-    analyticsModeParam !== "person_reid";
-  const mediaObjectClass = analyticsModeParam === "facial_expression" ? "object-cover" : "object-fill";
+    activeAnalyticsMode === null ||
+    activeAnalyticsMode === "person_count" ||
+    activeAnalyticsMode === "queue" ||
+    activeAnalyticsMode === "entry_exit_count";
+  const mediaObjectClass = activeAnalyticsMode === "facial_expression" ? "object-cover" : "object-fill";
   const shouldRefreshSnapshot =
     showSnapshot &&
     !staticFirstFrame &&
@@ -317,7 +335,7 @@ export function CameraFeed({
     setStreamNonce((value) => value + 1);
     setStreamReady(false);
     streamLoadedRef.current = false;
-  }, [analyticsModeParam, cameraId, staticFirstFrame, zoneId]);
+  }, [analyticsModeParam, backendZoneFilter, cameraId, staticFirstFrame]);
 
   useEffect(() => {
     if (!shouldRefreshSnapshot) return undefined;
@@ -393,7 +411,7 @@ export function CameraFeed({
         <svg className="absolute inset-0 h-full w-full" viewBox="0 0 100 100" preserveAspectRatio="none">
           {parsedZones.map((zone) => (
             <g key={zone.id}>
-              {analyticsMode !== "entry_exit_count" ? (
+              {activeAnalyticsMode !== "entry_exit_count" ? (
                 <>
                   {zone.polygons.map((poly: {x: number, y: number}[], i: number) => (
                     <polygon
@@ -417,7 +435,7 @@ export function CameraFeed({
                   </text>
                 </>
               ) : null}
-              {analyticsMode !== "entry_exit_count" && zone.entryLine ? (
+              {zone.entryLine ? (
                 <line
                   x1={zone.entryLine.x1}
                   y1={zone.entryLine.y1}
@@ -428,7 +446,7 @@ export function CameraFeed({
                   strokeDasharray="1.6 1.2"
                 />
               ) : null}
-              {analyticsMode !== "entry_exit_count" && zone.exitLine ? (
+              {zone.exitLine ? (
                 <line
                   x1={zone.exitLine.x1}
                   y1={zone.exitLine.y1}

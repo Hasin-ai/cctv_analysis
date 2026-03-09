@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -32,12 +33,16 @@ _SOURCE_FRAME_TIMEOUT_SECONDS = 12
 _FACIAL_EXPRESSION_RETRY_SECONDS = 30.0
 _FACIAL_REALTIME_DEFAULT_INTERVAL_SECONDS = 0.04
 _FACIAL_REALTIME_DEFAULT_CACHE_TTL_SECONDS = 2.0
+_RENDERED_FRAME_CACHE_TTL_SECONDS = 8.0
+_RENDERED_FRAME_CACHE_MAX_ENTRIES = 48
 _facial_expression_service: FacialExpressionRecognitionService | None = None
 _facial_expression_retry_after_monotonic = 0.0
 _facial_detection_cache: dict[int, "_FacialDetectionCacheEntry"] = {}
 _facial_detection_locks: dict[int, asyncio.Lock] = {}
 _facial_detection_tasks: dict[int, asyncio.Task[Any]] = {}
 _realtime_monitoring_tasks: set[asyncio.Task[Any]] = set()
+_rendered_frame_cache: dict[tuple[int, str, str, str], "_RenderedFrameCacheEntry"] = {}
+_rendered_frame_cache_lock = threading.Lock()
 logger = logging.getLogger(__name__)
 
 
@@ -48,6 +53,12 @@ class _FacialDetectionCacheEntry:
     frame_width: int
     frame_height: int
     detections: list[dict[str, Any]]
+
+
+@dataclass
+class _RenderedFrameCacheEntry:
+    payload: bytes
+    updated_at_monotonic: float
 
 
 async def _refresh_realtime_count_cache(
@@ -220,6 +231,88 @@ def _zone_filter_from_zones(zones: list[Any]) -> Any | None:
         return None
 
     return SimpleNamespace(polygon={"polygons": polygons})
+
+
+def _normalized_analytics_mode(analytics_mode: str | None) -> str:
+    return (analytics_mode or "").strip().lower()
+
+
+def _zone_scope_cache_key(zone: Any | None) -> str:
+    if zone is None:
+        return "none"
+
+    zone_id = getattr(zone, "id", None)
+    if zone_id is not None:
+        return f"zone:{int(zone_id)}"
+
+    polygon = getattr(zone, "polygon", None)
+    if polygon is None:
+        return "custom:none"
+    return f"custom:{abs(hash(repr(polygon)))}"
+
+
+def _zones_scope_cache_key(zones: list[Any]) -> str:
+    if not zones:
+        return "zones:none"
+
+    parts: list[str] = []
+    for zone in sorted(zones, key=lambda item: int(getattr(item, "id", 0))):
+        zone_id = int(getattr(zone, "id", 0))
+        polygon = getattr(zone, "polygon", None)
+        parts.append(f"{zone_id}:{abs(hash(repr(polygon)))}")
+    return "zones:" + "|".join(parts)
+
+
+def _get_cached_rendered_frame(
+    camera_id: int,
+    frame_token: str,
+    analytics_mode: str | None,
+    scope_key: str,
+) -> bytes | None:
+    now = time.monotonic()
+    cache_key = (int(camera_id), frame_token, _normalized_analytics_mode(analytics_mode) or "default", scope_key)
+    with _rendered_frame_cache_lock:
+        cached = _rendered_frame_cache.get(cache_key)
+        if cached is None:
+            return None
+        if now - cached.updated_at_monotonic > _RENDERED_FRAME_CACHE_TTL_SECONDS:
+            _rendered_frame_cache.pop(cache_key, None)
+            return None
+        cached.updated_at_monotonic = now
+        return cached.payload
+
+
+def _store_cached_rendered_frame(
+    camera_id: int,
+    frame_token: str,
+    analytics_mode: str | None,
+    scope_key: str,
+    payload: bytes,
+) -> None:
+    now = time.monotonic()
+    cache_key = (int(camera_id), frame_token, _normalized_analytics_mode(analytics_mode) or "default", scope_key)
+    with _rendered_frame_cache_lock:
+        _rendered_frame_cache[cache_key] = _RenderedFrameCacheEntry(
+            payload=payload,
+            updated_at_monotonic=now,
+        )
+        stale_keys = [
+            key
+            for key, entry in _rendered_frame_cache.items()
+            if now - entry.updated_at_monotonic > _RENDERED_FRAME_CACHE_TTL_SECONDS
+        ]
+        for stale_key in stale_keys:
+            _rendered_frame_cache.pop(stale_key, None)
+        if len(_rendered_frame_cache) <= _RENDERED_FRAME_CACHE_MAX_ENTRIES:
+            return
+
+        extra = len(_rendered_frame_cache) - _RENDERED_FRAME_CACHE_MAX_ENTRIES
+        oldest_keys = sorted(
+            _rendered_frame_cache,
+            key=lambda key: _rendered_frame_cache[key].updated_at_monotonic,
+        )[:extra]
+        for oldest_key in oldest_keys:
+            _rendered_frame_cache.pop(oldest_key, None)
 
 
 def _get_facial_detection_lock(camera_id: int) -> asyncio.Lock:
@@ -516,6 +609,131 @@ def _encode_jpeg(cv2: Any, image: Any):
     return cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
 
 
+async def _render_frame_payload(
+    session: AsyncSession,
+    camera_id: int,
+    frame: Any,
+    path: Path,
+    zone: Any | None,
+    analytics_mode: str | None,
+    *,
+    payload: bytes | None = None,
+    camera_zones: list[Any] | None = None,
+    frame_token: str | None = None,
+) -> bytes | None:
+    entry_exit_mode = _is_entry_exit_mode(analytics_mode)
+    facial_expression_mode = _is_facial_expression_mode(analytics_mode)
+    trajectory_heatmap_mode = _is_trajectory_heatmap_mode(analytics_mode)
+    person_reid_mode = _is_person_reid_mode(analytics_mode)
+
+    if not (zone is not None or entry_exit_mode or facial_expression_mode or trajectory_heatmap_mode or person_reid_mode):
+        return None
+
+    resolved_camera_zones = list(camera_zones or [])
+    facial_expression_zone_filter = zone
+    trajectory_zone_filter = zone
+
+    if entry_exit_mode and zone is None and not resolved_camera_zones:
+        resolved_camera_zones = await crud.list_zones(session, camera_id=camera_id)
+    if facial_expression_mode and not resolved_camera_zones:
+        resolved_camera_zones = await crud.list_zones(session, camera_id=camera_id)
+    if facial_expression_mode and facial_expression_zone_filter is None:
+        facial_expression_zone_filter = _zone_filter_from_zones(resolved_camera_zones)
+
+    scope_key = _zone_scope_cache_key(zone)
+    if entry_exit_mode and zone is None:
+        scope_key = _zones_scope_cache_key(resolved_camera_zones)
+    elif facial_expression_mode:
+        scope_key = _zone_scope_cache_key(facial_expression_zone_filter)
+    elif trajectory_heatmap_mode:
+        scope_key = _zone_scope_cache_key(trajectory_zone_filter)
+
+    resolved_frame_token = frame_token or f"{frame.id}:{path.stat().st_mtime_ns}"
+    cached_payload = _get_cached_rendered_frame(camera_id, resolved_frame_token, analytics_mode, scope_key)
+    if cached_payload is not None:
+        return cached_payload
+
+    try:
+        import cv2
+
+        image = None
+        if payload is not None:
+            import numpy as np
+
+            arr = np.frombuffer(payload, np.uint8)
+            image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        else:
+            image = cv2.imread(str(path))
+
+        if image is not None:
+            if trajectory_heatmap_mode:
+                heatmap_service = get_trajectory_heatmap_service()
+                if heatmap_service.is_available():
+                    overlay = await asyncio.to_thread(
+                        heatmap_service.render_overlay,
+                        camera_id,
+                        resolved_frame_token,
+                        image,
+                        trajectory_zone_filter,
+                    )
+                    image = overlay.get("frame", image)
+            elif person_reid_mode:
+                reid_overlay_service = get_person_reid_overlay_service()
+                if reid_overlay_service.is_available():
+                    overlay = await asyncio.to_thread(
+                        reid_overlay_service.render_overlay,
+                        camera_id,
+                        resolved_frame_token,
+                        image,
+                        zone,
+                    )
+                    image = overlay.get("frame", image)
+            elif facial_expression_mode:
+                detections = await _get_facial_detections_for_frame(
+                    camera_id,
+                    resolved_frame_token,
+                    image,
+                    facial_expression_zone_filter,
+                    non_blocking=True,
+                )
+                _draw_zone_polygons(cv2, image, facial_expression_zone_filter)
+                _draw_facial_expression_overlays(cv2, image, detections)
+            elif entry_exit_mode:
+                _draw_entry_exit_lines(cv2, image, [zone] if zone is not None else resolved_camera_zones)
+            elif zone is not None:
+                image = crop_image_to_zone(image, zone)
+
+            success, buffer = _encode_jpeg(cv2, image)
+            if success:
+                rendered_payload = buffer.tobytes()
+                _store_cached_rendered_frame(
+                    camera_id,
+                    resolved_frame_token,
+                    analytics_mode,
+                    scope_key,
+                    rendered_payload,
+                )
+                return rendered_payload
+    except Exception:
+        pass
+
+    if entry_exit_mode:
+        rendered_payload = _render_entry_exit_lines(
+            payload if payload is not None else path.read_bytes(),
+            [zone] if zone is not None else resolved_camera_zones,
+        )
+        _store_cached_rendered_frame(
+            camera_id,
+            resolved_frame_token,
+            analytics_mode,
+            scope_key,
+            rendered_payload,
+        )
+        return rendered_payload
+
+    return None
+
+
 async def _resolve_existing_frame(
     session: AsyncSession,
     camera_id: int,
@@ -561,16 +779,15 @@ def stop_analytics() -> dict[str, bool]:
 
 
 async def realtime(session: AsyncSession, camera_ids: list[int] | None = None):
-    all_cameras = await crud.list_cameras(session)
-    if camera_ids:
-        camera_filter = set(camera_ids)
-        cameras = [camera for camera in all_cameras if camera.id in camera_filter]
-    else:
-        cameras = all_cameras
+    cameras = await crud.list_cameras(session, camera_ids=camera_ids)
 
     service = get_realtime_monitoring_service()
     analytics_running = _analytics_running
     heartbeat_timeout = timedelta(seconds=max(1.0, float(settings.stream_heartbeat_timeout_seconds)))
+    camera_id_list = [camera.id for camera in cameras]
+    streams_by_camera = await crud.list_streams_for_cameras(session, camera_id_list)
+    zones_by_camera = await crud.list_zones_for_cameras(session, camera_id_list)
+    latest_frames_by_camera = await crud.get_latest_frames_for_cameras(session, camera_id_list)
 
     def _is_frame_fresh(frame: Any | None) -> bool:
         if frame is None or frame.timestamp is None:
@@ -585,9 +802,9 @@ async def realtime(session: AsyncSession, camera_ids: list[int] | None = None):
 
     output = []
     for camera in cameras:
-        stream = await crud.get_stream_by_camera(session, camera.id)
-        zones = await crud.list_zones(session, camera_id=camera.id)
-        latest_frame = await crud.get_latest_frame(session, camera.id)
+        stream = streams_by_camera.get(camera.id)
+        zones = zones_by_camera.get(camera.id, [])
+        latest_frame = latest_frames_by_camera.get(camera.id)
 
         has_frame = latest_frame is not None and Path(latest_frame.path).exists()
         frame_fresh = _is_frame_fresh(latest_frame) if has_frame else False
@@ -667,75 +884,9 @@ async def latest_frame(
     zone = await crud.get_zone(session, zone_id) if zone_id is not None else None
     if zone is not None and int(getattr(zone, "camera_id", 0)) != int(camera_id):
         zone = None
-    entry_exit_mode = _is_entry_exit_mode(analytics_mode)
-    facial_expression_mode = _is_facial_expression_mode(analytics_mode)
-    trajectory_heatmap_mode = _is_trajectory_heatmap_mode(analytics_mode)
-    person_reid_mode = _is_person_reid_mode(analytics_mode)
-    camera_zones: list[Any] = []
-    facial_expression_zone_filter = zone
-    trajectory_zone_filter = zone
-    if facial_expression_mode and facial_expression_zone_filter is None:
-        camera_zones = await crud.list_zones(session, camera_id=camera_id)
-    if facial_expression_mode and facial_expression_zone_filter is None:
-        facial_expression_zone_filter = _zone_filter_from_zones(camera_zones)
-
-    if zone is not None or entry_exit_mode or facial_expression_mode or trajectory_heatmap_mode or person_reid_mode:
-        try:
-            import cv2
-
-            image = cv2.imread(str(path))
-            if image is not None:
-                if trajectory_heatmap_mode:
-                    heatmap_service = get_trajectory_heatmap_service()
-                    if heatmap_service.is_available():
-                        frame_token = f"{frame.id}:{path.stat().st_mtime_ns}"
-                        overlay = await asyncio.to_thread(
-                            heatmap_service.render_overlay,
-                            camera_id,
-                            frame_token,
-                            image,
-                            trajectory_zone_filter,
-                        )
-                        image = overlay.get("frame", image)
-                elif person_reid_mode:
-                    reid_overlay_service = get_person_reid_overlay_service()
-                    if reid_overlay_service.is_available():
-                        frame_token = f"{frame.id}:{path.stat().st_mtime_ns}"
-                        overlay = await asyncio.to_thread(
-                            reid_overlay_service.render_overlay,
-                            camera_id,
-                            frame_token,
-                            image,
-                            zone,
-                        )
-                        image = overlay.get("frame", image)
-                elif facial_expression_mode:
-                    frame_token = f"{frame.id}:{path.stat().st_mtime_ns}"
-                    detections = await _get_facial_detections_for_frame(
-                        camera_id,
-                        frame_token,
-                        image,
-                        facial_expression_zone_filter,
-                        non_blocking=True,
-                    )
-                    _draw_zone_polygons(cv2, image, facial_expression_zone_filter)
-                    _draw_facial_expression_overlays(cv2, image, detections)
-                elif entry_exit_mode:
-                    zones = await crud.list_zones(session, camera_id=camera_id)
-                    _draw_entry_exit_lines(cv2, image, zones)
-                elif zone is not None:
-                    image = crop_image_to_zone(image, zone)
-
-                success, buffer = _encode_jpeg(cv2, image)
-                if success:
-                    return Response(content=buffer.tobytes(), media_type="image/jpeg")
-        except Exception:
-            pass
-
-    if entry_exit_mode:
-        zones = await crud.list_zones(session, camera_id=camera_id)
-        payload = _render_entry_exit_lines(path.read_bytes(), zones)
-        return Response(content=payload, media_type="image/jpeg")
+    rendered_payload = await _render_frame_payload(session, camera_id, frame, path, zone, analytics_mode)
+    if rendered_payload is not None:
+        return Response(content=rendered_payload, media_type="image/jpeg")
 
     return FileResponse(str(path), media_type="image/jpeg")
 
@@ -761,75 +912,9 @@ async def first_frame(
     zone = await crud.get_zone(session, zone_id) if zone_id is not None else None
     if zone is not None and int(getattr(zone, "camera_id", 0)) != int(camera_id):
         zone = None
-    entry_exit_mode = _is_entry_exit_mode(analytics_mode)
-    facial_expression_mode = _is_facial_expression_mode(analytics_mode)
-    trajectory_heatmap_mode = _is_trajectory_heatmap_mode(analytics_mode)
-    person_reid_mode = _is_person_reid_mode(analytics_mode)
-    camera_zones: list[Any] = []
-    facial_expression_zone_filter = zone
-    trajectory_zone_filter = zone
-    if facial_expression_mode and facial_expression_zone_filter is None:
-        camera_zones = await crud.list_zones(session, camera_id=camera_id)
-    if facial_expression_mode and facial_expression_zone_filter is None:
-        facial_expression_zone_filter = _zone_filter_from_zones(camera_zones)
-
-    if zone is not None or entry_exit_mode or facial_expression_mode or trajectory_heatmap_mode or person_reid_mode:
-        try:
-            import cv2
-
-            image = cv2.imread(str(path))
-            if image is not None:
-                if trajectory_heatmap_mode:
-                    heatmap_service = get_trajectory_heatmap_service()
-                    if heatmap_service.is_available():
-                        frame_token = f"{frame.id}:{path.stat().st_mtime_ns}"
-                        overlay = await asyncio.to_thread(
-                            heatmap_service.render_overlay,
-                            camera_id,
-                            frame_token,
-                            image,
-                            trajectory_zone_filter,
-                        )
-                        image = overlay.get("frame", image)
-                elif person_reid_mode:
-                    reid_overlay_service = get_person_reid_overlay_service()
-                    if reid_overlay_service.is_available():
-                        frame_token = f"{frame.id}:{path.stat().st_mtime_ns}"
-                        overlay = await asyncio.to_thread(
-                            reid_overlay_service.render_overlay,
-                            camera_id,
-                            frame_token,
-                            image,
-                            zone,
-                        )
-                        image = overlay.get("frame", image)
-                elif facial_expression_mode:
-                    frame_token = f"{frame.id}:{path.stat().st_mtime_ns}"
-                    detections = await _get_facial_detections_for_frame(
-                        camera_id,
-                        frame_token,
-                        image,
-                        facial_expression_zone_filter,
-                        non_blocking=True,
-                    )
-                    _draw_zone_polygons(cv2, image, facial_expression_zone_filter)
-                    _draw_facial_expression_overlays(cv2, image, detections)
-                elif entry_exit_mode:
-                    zones = await crud.list_zones(session, camera_id=camera_id)
-                    _draw_entry_exit_lines(cv2, image, zones)
-                elif zone is not None:
-                    image = crop_image_to_zone(image, zone)
-
-                success, buffer = _encode_jpeg(cv2, image)
-                if success:
-                    return Response(content=buffer.tobytes(), media_type="image/jpeg")
-        except Exception:
-            pass
-
-    if entry_exit_mode:
-        zones = await crud.list_zones(session, camera_id=camera_id)
-        payload = _render_entry_exit_lines(path.read_bytes(), zones)
-        return Response(content=payload, media_type="image/jpeg")
+    rendered_payload = await _render_frame_payload(session, camera_id, frame, path, zone, analytics_mode)
+    if rendered_payload is not None:
+        return Response(content=rendered_payload, media_type="image/jpeg")
 
     return FileResponse(str(path), media_type="image/jpeg")
 
@@ -1006,11 +1091,6 @@ async def mjpeg_stream(
             or (draw_facial_expression and zone is None)
         )
         camera_zones = await crud.list_zones(session, camera_id=camera_id) if needs_camera_zones else []
-        zones = camera_zones if draw_entry_exit_lines else []
-        facial_expression_zone_filter = zone
-        trajectory_zone_filter = zone
-        if draw_facial_expression and facial_expression_zone_filter is None:
-            facial_expression_zone_filter = _zone_filter_from_zones(camera_zones)
 
     if not camera:
         raise HTTPException(status_code=404, detail="Camera not found")
@@ -1047,58 +1127,20 @@ async def mjpeg_stream(
             payload = path.read_bytes()
 
             if zone is not None or draw_entry_exit_lines or draw_facial_expression or draw_trajectory_heatmap or draw_person_reid:
-                try:
-                    import cv2
-                    import numpy as np
-
-                    arr = np.frombuffer(payload, np.uint8)
-                    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                    if img is not None:
-                        if draw_trajectory_heatmap:
-                            heatmap_service = get_trajectory_heatmap_service()
-                            if heatmap_service.is_available():
-                                overlay = await asyncio.to_thread(
-                                    heatmap_service.render_overlay,
-                                    camera_id,
-                                    token,
-                                    img,
-                                    trajectory_zone_filter,
-                                )
-                                img = overlay.get("frame", img)
-                        elif draw_person_reid:
-                            reid_overlay_service = get_person_reid_overlay_service()
-                            if reid_overlay_service.is_available():
-                                overlay = await asyncio.to_thread(
-                                    reid_overlay_service.render_overlay,
-                                    camera_id,
-                                    token,
-                                    img,
-                                    zone,
-                                )
-                                img = overlay.get("frame", img)
-                        elif draw_facial_expression:
-                            detections = await _get_facial_detections_for_frame(
-                                camera_id,
-                                token,
-                                img,
-                                facial_expression_zone_filter,
-                                non_blocking=True,
-                            )
-                            # Draw zone boundary on full-frame image
-                            active_zone = zone if zone is not None else facial_expression_zone_filter
-                            _draw_zone_polygons(cv2, img, active_zone)
-                            _draw_facial_expression_overlays(cv2, img, detections)
-                        elif draw_entry_exit_lines and zones:
-                            _draw_entry_exit_lines(cv2, img, zones)
-
-                        if zone is not None and not draw_facial_expression and not draw_trajectory_heatmap and not draw_person_reid:
-                            img = crop_image_to_zone(img, zone)
-
-                        success, enc_buffer = _encode_jpeg(cv2, img)
-                        if success:
-                            payload = enc_buffer.tobytes()
-                except Exception:
-                    pass
+                async with AsyncSessionLocal() as render_session:
+                    rendered_payload = await _render_frame_payload(
+                        render_session,
+                        camera_id,
+                        frame,
+                        path,
+                        zone,
+                        analytics_mode,
+                        payload=payload,
+                        camera_zones=camera_zones if (draw_entry_exit_lines or draw_facial_expression) else None,
+                        frame_token=token,
+                    )
+                if rendered_payload is not None:
+                    payload = rendered_payload
 
             headers = (
                 f"--{boundary}\r\n"

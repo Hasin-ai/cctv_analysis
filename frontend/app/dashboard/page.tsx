@@ -1,12 +1,21 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Pencil, Pause, Play, Plus, Search, Trash2, Filter } from "lucide-react";
 
 import type { RealtimeZoneCount } from "@/lib/api";
-import { type FootfallResponse, type Zone, getFootfall, listZones } from "@/lib/api";
+import { type FootfallResponse, type Zone, getFootfall, getRuntimeConfig, listZones } from "@/lib/api";
+import {
+  DASHBOARD_OVERLAY_CONFIG_KEY,
+  type DashboardOverlayConfig,
+  getDashboardOverlayModes,
+  normalizeDashboardOverlayConfig,
+  readDashboardOverlayConfigFromStorage,
+  writeDashboardOverlayConfigToStorage,
+} from "@/lib/dashboard-overlay-config";
 import { isZoneFilterSelected, parseSelectedZoneId } from "@/lib/zone-selection";
+import { usePageVisibility } from "@/hooks/use-page-visibility";
 import { useSourcesData } from "@/hooks/use-sources-data";
 import {
   CameraFeed,
@@ -379,6 +388,7 @@ function formatDateLabel(value: string | null | undefined): string {
 
 export default function DashboardPage() {
   const router = useRouter();
+  const isPageVisible = usePageVisibility();
   const [overlayMode, setOverlayMode] = useState<AnalyticsMode>("person_count");
   const enableRealtimeMonitoring = true;
   const {
@@ -405,6 +415,9 @@ export default function DashboardPage() {
   const [analyticsSearchQuery, setAnalyticsSearchQuery] = useState("");
   const [timeRange, setTimeRange] = useState<"12h" | "today" | "24h">("today");
   const [showZoneEditor, setShowZoneEditor] = useState(false);
+  const [dashboardOverlayConfig, setDashboardOverlayConfig] = useState<DashboardOverlayConfig>({});
+  const [overlayConfigLoaded, setOverlayConfigLoaded] = useState(false);
+  const deferredSelectedZoneId = useDeferredValue(selectedZoneId);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -420,6 +433,26 @@ export default function DashboardPage() {
     if (typeof window === "undefined") return;
     window.localStorage.setItem(OVERLAY_MODE_STORAGE_KEY, overlayMode);
   }, [overlayMode]);
+
+  const loadDashboardOverlayConfig = useCallback(async () => {
+    try {
+      const payload = await getRuntimeConfig();
+      const runtimeConfig = normalizeDashboardOverlayConfig(payload.config?.[DASHBOARD_OVERLAY_CONFIG_KEY]);
+      const nextConfig =
+        Object.keys(runtimeConfig).length > 0 ? runtimeConfig : readDashboardOverlayConfigFromStorage();
+      setDashboardOverlayConfig(nextConfig);
+      writeDashboardOverlayConfigToStorage(nextConfig);
+    } catch {
+      setDashboardOverlayConfig(readDashboardOverlayConfigFromStorage());
+    } finally {
+      setOverlayConfigLoaded(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isPageVisible) return;
+    void loadDashboardOverlayConfig();
+  }, [isPageVisible, loadDashboardOverlayConfig]);
 
   const getStartTimestamp = useCallback(() => {
     if (timeRange === "12h") return hoursAgoIso(12);
@@ -455,8 +488,28 @@ export default function DashboardPage() {
     }
   }, [selectedCameraId, sourceById, sources]);
 
+  const selected = selectedCameraId ? sourceById.get(selectedCameraId) ?? null : null;
+  const availableOverlayModes = useMemo(() => {
+    if (!selected) return [];
+    const zoneId = parseSelectedZoneId(selectedZoneId);
+    const allowedModes = new Set(getDashboardOverlayModes(dashboardOverlayConfig, selected.camera.id, zoneId));
+    return ANALYTICS_MODES.filter((mode) => allowedModes.has(mode.id));
+  }, [dashboardOverlayConfig, selected, selectedZoneId]);
+  const activeOverlayMode = useMemo<AnalyticsMode | null>(() => {
+    if (availableOverlayModes.some((mode) => mode.id === overlayMode)) {
+      return overlayMode;
+    }
+    return availableOverlayModes[0]?.id ?? null;
+  }, [availableOverlayModes, overlayMode]);
+  const deferredOverlayMode = useDeferredValue(activeOverlayMode);
+
   useEffect(() => {
-    if (!analyticsRunning || overlayMode !== "person_count") return;
+    if (!activeOverlayMode || overlayMode === activeOverlayMode) return;
+    setOverlayMode(activeOverlayMode);
+  }, [activeOverlayMode, overlayMode]);
+
+  useEffect(() => {
+    if (!analyticsRunning || deferredOverlayMode !== "person_count") return;
     setHistoryByCamera((previous) => {
       const next = { ...previous };
 
@@ -464,7 +517,7 @@ export default function DashboardPage() {
         if (!source.realtime) continue;
         // If a specific zone is selected, use that zone's live counts for the timeline
         let currentPerson = source.realtime.total_person_count;
-        const zoneId = parseSelectedZoneId(selectedZoneId);
+        const zoneId = parseSelectedZoneId(deferredSelectedZoneId);
 
         if (zoneId !== null) {
           const activeZone = source.realtime.zones?.find((z) => z.zone_id === zoneId);
@@ -483,7 +536,7 @@ export default function DashboardPage() {
 
       return next;
     });
-  }, [analyticsRunning, overlayMode, sources, selectedZoneId]);
+  }, [analyticsRunning, deferredOverlayMode, deferredSelectedZoneId, sources]);
 
   const loadZones = useCallback(async (cameraId: number) => {
     try {
@@ -497,11 +550,12 @@ export default function DashboardPage() {
   useEffect(() => {
     if (!selectedCameraId) return;
     void loadZones(selectedCameraId);
+    if (!isPageVisible) return;
     const id = window.setInterval(() => {
       void loadZones(selectedCameraId);
     }, 5000);
     return () => window.clearInterval(id);
-  }, [loadZones, selectedCameraId]);
+  }, [isPageVisible, loadZones, selectedCameraId]);
 
   useEffect(() => {
     if (!selectedZoneId) return;
@@ -535,25 +589,25 @@ export default function DashboardPage() {
   }, [getStartTimestamp]);
 
   useEffect(() => {
-    const shouldPollFootfall = overlayMode === "person_count" || overlayMode === "entry_exit_count";
+    const shouldPollFootfall = deferredOverlayMode === "person_count" || deferredOverlayMode === "entry_exit_count";
     if (!selectedCameraId || !shouldPollFootfall) return;
-    void loadFootfall(selectedCameraId, selectedZoneId);
+    void loadFootfall(selectedCameraId, deferredSelectedZoneId);
+    if (!isPageVisible) return;
     const id = window.setInterval(() => {
-      void loadFootfall(selectedCameraId, selectedZoneId);
+      void loadFootfall(selectedCameraId, deferredSelectedZoneId);
     }, 5000);
     return () => window.clearInterval(id);
-  }, [loadFootfall, overlayMode, selectedCameraId, selectedZoneId]);
+  }, [deferredOverlayMode, deferredSelectedZoneId, isPageVisible, loadFootfall, selectedCameraId]);
 
-  const selected = selectedCameraId ? sourceById.get(selectedCameraId) ?? null : null;
   const selectedTimeline = useMemo(() => {
     if (!selected) return [];
-    const historyKey = `${selected.camera.id}-${parseSelectedZoneId(selectedZoneId) ?? "none"}`;
+    const historyKey = `${selected.camera.id}-${parseSelectedZoneId(deferredSelectedZoneId) ?? "none"}`;
     const series = historyByCamera[historyKey] ?? [];
     if (series.length === 0) {
       return [toTimelinePoint(0)];
     }
     return series;
-  }, [historyByCamera, selected, selectedZoneId]);
+  }, [deferredSelectedZoneId, historyByCamera, selected]);
   const selectedFootfall = useMemo(() => {
     if (!selected) return null;
     return footfallByCamera[selected.camera.id] ?? null;
@@ -569,19 +623,19 @@ export default function DashboardPage() {
     },
     [analyticsQuery, hasAnalyticsQuery],
   );
-  const showPersonCountPanel = overlayMode === "person_count" && matchesAnalyticsPanel("person_count");
+  const showPersonCountPanel = deferredOverlayMode === "person_count" && matchesAnalyticsPanel("person_count");
   const showTrajectoryHeatmapPanel =
-    overlayMode === "trajectory_heatmap" && matchesAnalyticsPanel("trajectory_heatmap");
-  const showFacialExpressionPanel = overlayMode === "facial_expression" && matchesAnalyticsPanel("facial_expression");
-  const showEntryExitPanel = overlayMode === "entry_exit_count" && matchesAnalyticsPanel("entry_exit_count");
-  const showPersonReidPanel = overlayMode === "person_reid" && matchesAnalyticsPanel("person_reid");
+    deferredOverlayMode === "trajectory_heatmap" && matchesAnalyticsPanel("trajectory_heatmap");
+  const showFacialExpressionPanel = deferredOverlayMode === "facial_expression" && matchesAnalyticsPanel("facial_expression");
+  const showEntryExitPanel = deferredOverlayMode === "entry_exit_count" && matchesAnalyticsPanel("entry_exit_count");
+  const showPersonReidPanel = deferredOverlayMode === "person_reid" && matchesAnalyticsPanel("person_reid");
   const queueMatchedBySearch = matchesAnalyticsPanel("queue");
   const showZoneAnalysisPanel =
-    overlayMode === "person_count" &&
+    deferredOverlayMode === "person_count" &&
     (!hasAnalyticsQuery ||
       ZONE_ANALYSIS_SEARCH_TERMS.some((term) => term.includes(analyticsQuery) || analyticsQuery.includes(term)));
-  const showQueuePanel = queueMatchedBySearch && overlayMode === "queue";
-  const showQueueOverlayHint = hasAnalyticsQuery && queueMatchedBySearch && overlayMode !== "queue";
+  const showQueuePanel = queueMatchedBySearch && deferredOverlayMode === "queue";
+  const showQueueOverlayHint = hasAnalyticsQuery && queueMatchedBySearch && deferredOverlayMode !== "queue";
   const hasMatchedAnalyticsPanel =
     showPersonCountPanel ||
     showTrajectoryHeatmapPanel ||
@@ -591,6 +645,7 @@ export default function DashboardPage() {
     showQueuePanel ||
     showZoneAnalysisPanel ||
     showQueueOverlayHint;
+  const showOverlayConfigurationHint = overlayConfigLoaded && selected && availableOverlayModes.length === 0;
   const entryExitZoneSearchQuery = "";
 
 
@@ -696,10 +751,7 @@ export default function DashboardPage() {
                     <p className="mt-2 truncate text-[11px] text-muted-foreground">
                       Last frame: {formatFrameTimestamp(source.realtime?.frame_timestamp)}
                     </p>
-                    <div className="mt-2.5 flex items-center justify-between gap-2">
-                      <span className="truncate text-[11px] tabular-nums text-muted-foreground" title={`Uptime: ${source.uptime}`}>
-                        Uptime: {source.uptime}
-                      </span>
+                    <div className="mt-2.5 flex items-center justify-end gap-2">
                       <div className="flex items-center gap-1.5">
                         <button
                           type="button"
@@ -753,15 +805,25 @@ export default function DashboardPage() {
             right={
               <div className="flex items-center gap-2">
                 <select
-                  value={overlayMode}
-                  onChange={(e) => setOverlayMode(e.target.value as AnalyticsMode)}
+                  value={activeOverlayMode ?? ""}
+                  onChange={(e) => {
+                    if (!e.target.value) return;
+                    setOverlayMode(e.target.value as AnalyticsMode);
+                  }}
+                  disabled={!overlayConfigLoaded || availableOverlayModes.length === 0}
                   className="h-9 rounded-lg border border-input bg-white px-3 text-sm text-foreground shadow-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
                 >
-                  {ANALYTICS_MODES.map((mode) => (
-                    <option key={mode.id} value={mode.id}>
-                      Overlay: {mode.label}
-                    </option>
-                  ))}
+                  {!overlayConfigLoaded ? (
+                    <option value="">Loading configured overlays...</option>
+                  ) : availableOverlayModes.length === 0 ? (
+                    <option value="">No configured overlays</option>
+                  ) : (
+                    availableOverlayModes.map((mode) => (
+                      <option key={mode.id} value={mode.id}>
+                        Overlay: {mode.label}
+                      </option>
+                    ))
+                  )}
                 </select>
                 <select
                   value={selectedZoneId}
@@ -791,7 +853,7 @@ export default function DashboardPage() {
                   detectionBoxes={selected.realtime?.detection_boxes ?? []}
                   hasLiveFrame={selected.hasLiveFrame}
                   staticFirstFrame={false}
-                  analyticsMode={overlayMode}
+                  analyticsMode={activeOverlayMode}
                   zoneId={selectedZoneId || undefined}
                 />
 
@@ -834,6 +896,13 @@ export default function DashboardPage() {
           </div>
 
           <div className="grid gap-3">
+            {showOverlayConfigurationHint ? (
+              <div className="rounded-xl border border-border/70 bg-white px-4 py-3 text-sm text-muted-foreground">
+                No analytics overlays are configured for this selection. Use Zone Configuration and run analytics for this
+                camera{isZoneFilterSelected(selectedZoneId) ? " and zone" : ""} to make overlays available here.
+              </div>
+            ) : null}
+
             {hasAnalyticsQuery && !hasMatchedAnalyticsPanel ? (
               <div className="rounded-xl border border-border/70 bg-white px-4 py-3 text-sm text-muted-foreground">
                 No analytics section matches {analyticsSearchQuery.trim()}. Try: person count, facial expression, queue management, person reid, entry exit, zone analysis.
@@ -847,8 +916,8 @@ export default function DashboardPage() {
                   zones={zonesByCamera[selected.camera.id] ?? []}
                   liveZones={selected?.realtime?.zones ?? []}
                   footfall={selectedFootfall}
-                  selectedZoneId={selectedZoneId}
-                  isPersonCountMode={overlayMode === "person_count"}
+                  selectedZoneId={deferredSelectedZoneId}
+                  isPersonCountMode={deferredOverlayMode === "person_count"}
                   sourceType={selected.type}
                 />
               </PanelCard>
@@ -861,7 +930,7 @@ export default function DashboardPage() {
               >
                 <div className="rounded-xl border border-border/70 bg-white/80 px-4 py-3 text-sm text-slate-700">
                   Trajectory heatmap overlay is active on the video feed.
-                  {isZoneFilterSelected(selectedZoneId)
+                  {isZoneFilterSelected(deferredSelectedZoneId)
                     ? " Density is computed from tracked object paths inside the selected zone."
                     : " Density is computed from tracked object paths across the full frame."}
                 </div>
@@ -872,14 +941,14 @@ export default function DashboardPage() {
               <PanelCard
                 title="Facial Expression Recognition"
                 subtitle={
-                  isZoneFilterSelected(selectedZoneId)
+                  isZoneFilterSelected(deferredSelectedZoneId)
                     ? "Emotion recognition for faces detected inside the selected zone"
                     : "Emotion recognition for faces detected inside configured zones"
                 }
               >
                 <FacialExpressionPanel
                   cameraId={selected.camera.id}
-                  selectedZoneId={selectedZoneId}
+                  selectedZoneId={deferredSelectedZoneId}
                   start={getStartTimestamp()}
                 />
               </PanelCard>
@@ -892,7 +961,7 @@ export default function DashboardPage() {
               >
                 <ZoneAnalysisPanel
                   cameraId={selected.camera.id}
-                  selectedZoneId={selectedZoneId}
+                  selectedZoneId={deferredSelectedZoneId}
                   start={getStartTimestamp()}
                 />
               </PanelCard>
@@ -907,14 +976,14 @@ export default function DashboardPage() {
                   footfall={selectedFootfall}
                   liveZones={selected?.realtime?.zones ?? []}
                   searchQuery={entryExitZoneSearchQuery}
-                  selectedZoneId={selectedZoneId}
+                  selectedZoneId={deferredSelectedZoneId}
                 />
               </PanelCard>
             ) : null}
 
             {showPersonReidPanel ? (
               <PanelCard title="Person ReID Analytics" subtitle="Track occurrences and dwell times across views">
-                <PersonReidAnalyticsPanel cameraId={selected.camera.id} selectedZoneId={selectedZoneId} />
+                <PersonReidAnalyticsPanel cameraId={selected.camera.id} selectedZoneId={deferredSelectedZoneId} />
               </PanelCard>
             ) : null}
 
@@ -923,7 +992,7 @@ export default function DashboardPage() {
                 <QueueAnalyticsPanel
                   cameraId={selected.camera.id}
                   zones={zonesByCamera[selected.camera.id] ?? []}
-                  selectedZoneId={selectedZoneId}
+                  selectedZoneId={deferredSelectedZoneId}
                 />
               </PanelCard>
             ) : null}

@@ -182,6 +182,7 @@ class ReconstructionCreate(BaseModel):
     draw_tracking: bool = False
     draw_facial_expression: bool = False
     facial_expression_zone_id: int | None = None
+    output_fps: float | None = None
 
 
 class ReconstructionRead(BaseModel):

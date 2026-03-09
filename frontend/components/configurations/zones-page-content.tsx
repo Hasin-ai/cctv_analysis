@@ -7,10 +7,22 @@ import { type DrawMode, type PolygonCanvasHandle, type Pt, type Shape, PolygonCa
 import { ANALYTICS_MODES, type AnalyticsMode, PanelCard, StatusPill } from "@/components/v2/ui";
 import { useSourcesData } from "@/hooks/use-sources-data";
 import {
+  DASHBOARD_OVERLAY_CONFIG_KEY,
+  getDashboardOverlayModes,
+  mergeDashboardOverlayModes,
+  normalizeDashboardOverlayConfig,
+  readDashboardOverlayConfigFromStorage,
+  removeDashboardOverlayZone,
+  setDashboardOverlayModes,
+  type DashboardOverlayConfig,
+  writeDashboardOverlayConfigToStorage,
+} from "@/lib/dashboard-overlay-config";
+import {
   type Zone,
   createZone,
   deleteZone,
   getAnalyticsRunState,
+  getRuntimeConfig,
   listZones,
   runAnalyzerAnalysis,
   runFacialExpressionRecognition,
@@ -19,6 +31,7 @@ import {
   startAnalyticsRun,
   stopStream,
   runQueueAnalysis,
+  updateRuntimeConfig,
 } from "@/lib/api";
 
 const ZONE_COLORS = [
@@ -202,6 +215,16 @@ function formatTimestamp(value: string | null | undefined): string {
   return parsed.toLocaleString();
 }
 
+async function loadDashboardOverlayConfig() {
+  const payload = await getRuntimeConfig();
+  const config = normalizeDashboardOverlayConfig(payload.config?.[DASHBOARD_OVERLAY_CONFIG_KEY]);
+  if (Object.keys(config).length > 0) {
+    writeDashboardOverlayConfigToStorage(config);
+    return config;
+  }
+  return readDashboardOverlayConfigFromStorage();
+}
+
 function isTypingTarget(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false;
   const tag = target.tagName.toLowerCase();
@@ -246,6 +269,7 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
   const [stagedAnalyticsTypes, setStagedAnalyticsTypes] = useState<AnalyticsMode[]>([]);
   const [localAnalyticsTasks, setLocalAnalyticsTasks] = useState<LocalAnalyticsTask[]>([]);
   const [queueBusy, setQueueBusy] = useState(false);
+  const [dashboardOverlayConfig, setDashboardOverlayConfig] = useState<DashboardOverlayConfig>({});
   const canvasRef = useRef<PolygonCanvasHandle | null>(null);
   // Mirror of canvasPolygons kept in a ref so the savedPolygons useEffect can
   // always read the latest value without adding it to the dependency array.
@@ -383,10 +407,34 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
     }
   }, [isCreatingZone, selectedZoneId, selectedZones]);
 
-  // Clear staged analytics when changing zones
   useEffect(() => {
-    setStagedAnalyticsTypes([]);
-  }, [selectedZoneId]);
+    let active = true;
+
+    void (async () => {
+      try {
+        const config = await loadDashboardOverlayConfig();
+        if (!active) return;
+        setDashboardOverlayConfig(config);
+      } catch {
+        if (!active) return;
+        setDashboardOverlayConfig({});
+      }
+    })();
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!selectedCameraId || !selectedZoneId) {
+      setStagedAnalyticsTypes([]);
+      return;
+    }
+
+    const configuredModes = getDashboardOverlayModes(dashboardOverlayConfig, selectedCameraId, selectedZoneId);
+    setStagedAnalyticsTypes(configuredModes as AnalyticsMode[]);
+  }, [dashboardOverlayConfig, selectedCameraId, selectedZoneId]);
 
   useEffect(() => {
     setIsCreatingZone(false);
@@ -732,17 +780,37 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
       setError("Select a zone to delete");
       return;
     }
+    const zoneIdToDelete = selectedZoneId;
     const zone = selectedZones.find((z) => z.id === selectedZoneId);
     const confirmed = window.confirm(`Delete zone "${zone?.name ?? selectedZoneId}"?`);
     if (!confirmed) return;
     setError("");
     setNotice("");
     try {
-      await deleteZone(selectedZoneId);
+      await deleteZone(zoneIdToDelete);
+      let overlayConfigUpdated = true;
+      if (selectedCameraId) {
+        try {
+          const nextOverlayConfig = removeDashboardOverlayZone(
+            dashboardOverlayConfig,
+            selectedCameraId,
+            zoneIdToDelete,
+          );
+          setDashboardOverlayConfig(nextOverlayConfig);
+          writeDashboardOverlayConfigToStorage(nextOverlayConfig);
+          await updateRuntimeConfig(DASHBOARD_OVERLAY_CONFIG_KEY, nextOverlayConfig);
+        } catch {
+          overlayConfigUpdated = false;
+        }
+      }
       setSelectedZoneId(null);
       setIsCreatingZone(false);
       if (selectedCameraId) await refreshZones(selectedCameraId);
-      setNotice("Zone deleted.");
+      setNotice(
+        overlayConfigUpdated
+          ? "Zone deleted."
+          : "Zone deleted. Dashboard overlay options may need another analytics save to refresh.",
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to delete zone");
     }
@@ -761,6 +829,33 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
       .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
       .slice(0, 12);
   }, [localAnalyticsTasks]);
+
+  const persistStagedAnalyticsTypes = useCallback(
+    async (nextModes: AnalyticsMode[]) => {
+      if (!selectedCameraId || !selectedZoneId) {
+        setStagedAnalyticsTypes(nextModes);
+        return;
+      }
+
+      const nextConfig = setDashboardOverlayModes(
+        dashboardOverlayConfig,
+        selectedCameraId,
+        selectedZoneId,
+        nextModes,
+      );
+
+      setDashboardOverlayConfig(nextConfig);
+      setStagedAnalyticsTypes(nextModes);
+      writeDashboardOverlayConfigToStorage(nextConfig);
+
+      try {
+        await updateRuntimeConfig(DASHBOARD_OVERLAY_CONFIG_KEY, nextConfig);
+      } catch {
+        setNotice("Saved analytics selection locally, but dashboard sync to backend failed.");
+      }
+    },
+    [dashboardOverlayConfig, selectedCameraId, selectedZoneId, setNotice],
+  );
   
   async function enqueueAnalyticsForZone() {
     if (!selectedCameraId) {
@@ -962,9 +1057,27 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
         });
       }
 
+      let overlayConfigUpdated = true;
+      try {
+        const nextOverlayConfig = mergeDashboardOverlayModes(
+        dashboardOverlayConfig,
+        selectedCameraId,
+        selectedZone.id,
+        stagedAnalyticsTypes,
+      );
+        setDashboardOverlayConfig(nextOverlayConfig);
+        writeDashboardOverlayConfigToStorage(nextOverlayConfig);
+        await updateRuntimeConfig(DASHBOARD_OVERLAY_CONFIG_KEY, nextOverlayConfig);
+      } catch {
+        overlayConfigUpdated = false;
+      }
+
       setLocalAnalyticsTasks((previous) => [...newTasks, ...previous].slice(0, 12));
-      setStagedAnalyticsTypes([]);
-      setNotice(`Started ${newTasks.length} analytics process(es) for zone "${selectedZone.name}"`);
+      setNotice(
+        overlayConfigUpdated
+          ? `Started ${newTasks.length} analytics process(es) for zone "${selectedZone.name}"`
+          : `Started ${newTasks.length} analytics process(es) for zone "${selectedZone.name}". Dashboard overlays may update after the next config sync.`,
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to run analytics");
     } finally {
@@ -974,11 +1087,11 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
 
   function addStagedAnalytics() {
     if (stagedAnalyticsTypes.includes(analyticsMode)) return;
-    setStagedAnalyticsTypes((prev) => [...prev, analyticsMode]);
+    void persistStagedAnalyticsTypes([...stagedAnalyticsTypes, analyticsMode]);
   }
 
   function removeStagedAnalytics(mode: AnalyticsMode) {
-    setStagedAnalyticsTypes((prev) => prev.filter((m) => m !== mode));
+    void persistStagedAnalyticsTypes(stagedAnalyticsTypes.filter((m) => m !== mode));
   }
 
   function handleDeleteQueueRow(id: string) {

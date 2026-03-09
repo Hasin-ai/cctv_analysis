@@ -32,6 +32,7 @@ async def create_reconstruction(
         draw_tracking=payload.draw_tracking,
         draw_facial_expression=payload.draw_facial_expression,
         facial_expression_zone_id=payload.facial_expression_zone_id,
+        output_fps=payload.output_fps,
     )
     return job
 
@@ -59,6 +60,7 @@ async def download_reconstruction(session: AsyncSession, job_id: int):
         output_path,
         media_type="video/mp4",
         filename=f"reconstruction_{job_id}.mp4",
+        content_disposition_type="inline",
         headers={
             "Cache-Control": "no-store, no-cache, must-revalidate",
             "Pragma": "no-cache",

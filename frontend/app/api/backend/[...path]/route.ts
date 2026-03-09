@@ -55,6 +55,10 @@ export async function GET(req: NextRequest, ctx: RouteContext): Promise<Response
   return forward(req, ctx.params.path);
 }
 
+export async function HEAD(req: NextRequest, ctx: RouteContext): Promise<Response> {
+  return forward(req, ctx.params.path);
+}
+
 export async function POST(req: NextRequest, ctx: RouteContext): Promise<Response> {
   return forward(req, ctx.params.path);
 }

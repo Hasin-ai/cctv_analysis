@@ -6,6 +6,7 @@ import {
   type FacialExpressionRealtimeResponse,
   getFacialExpressionRealtime,
 } from "@/lib/api";
+import { usePageVisibility } from "@/hooks/use-page-visibility";
 import { isZoneFilterSelected, parseSelectedZoneId } from "@/lib/zone-selection";
 import { StatTile } from "@/components/v2/ui";
 
@@ -30,6 +31,7 @@ export function FacialExpressionPanel({
   const [error, setError] = useState<string | null>(null);
   void start;
 
+  const isPageVisible = usePageVisibility();
   const analysisRequestRef = useRef(0);
   const inFlightRef = useRef(false);
 
@@ -65,6 +67,7 @@ export function FacialExpressionPanel({
   }, [cameraId, zoneId]);
 
   useEffect(() => {
+    if (!isPageVisible) return undefined;
     analysisRequestRef.current += 1;
     const requestId = analysisRequestRef.current;
     let timeoutId: number | null = null;
@@ -88,7 +91,7 @@ export function FacialExpressionPanel({
         window.clearTimeout(timeoutId);
       }
     };
-  }, [runAnalysis]);
+  }, [isPageVisible, runAnalysis]);
 
   const emotionRows = useMemo(() => {
     if (!data) return [];

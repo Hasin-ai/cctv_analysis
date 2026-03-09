@@ -35,6 +35,7 @@ RUNTIME_KEYS: dict[str, type] = {
     "personvit_trust_checkpoint": bool,
     "analytics_frame_stride": int,
     "analytics_max_frames": int,
+    "dashboard_overlay_modes": dict,
 }
 
 
@@ -45,6 +46,10 @@ def _normalize_value(value: Any, expected_type: type) -> Any:
         return int(value)
     if expected_type is float:
         return float(value)
+    if expected_type is dict:
+        if not isinstance(value, dict):
+            raise ValueError("Expected an object value")
+        return value
     return value
 
 

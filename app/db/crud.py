@@ -38,8 +38,13 @@ async def create_camera(session: AsyncSession, name: str, rtsp_url: str | None, 
     return camera
 
 
-async def list_cameras(session: AsyncSession) -> list[Camera]:
-    result = await session.execute(select(Camera).order_by(Camera.id))
+async def list_cameras(session: AsyncSession, camera_ids: list[int] | None = None) -> list[Camera]:
+    stmt = select(Camera)
+    if camera_ids is not None:
+        if not camera_ids:
+            return []
+        stmt = stmt.where(Camera.id.in_(camera_ids))
+    result = await session.execute(stmt.order_by(Camera.id))
     return list(result.scalars())
 
 
@@ -81,6 +86,21 @@ async def get_stream(session: AsyncSession, stream_id: int) -> Stream | None:
 async def list_streams(session: AsyncSession) -> list[Stream]:
     result = await session.execute(select(Stream).order_by(Stream.id))
     return list(result.scalars())
+
+
+async def list_streams_for_cameras(session: AsyncSession, camera_ids: list[int]) -> dict[int, Stream]:
+    if not camera_ids:
+        return {}
+
+    result = await session.execute(
+        select(Stream)
+        .where(Stream.camera_id.in_(camera_ids))
+        .order_by(Stream.camera_id, Stream.id.desc())
+    )
+    streams_by_camera: dict[int, Stream] = {}
+    for stream in result.scalars():
+        streams_by_camera.setdefault(stream.camera_id, stream)
+    return streams_by_camera
 
 
 async def delete_stream(session: AsyncSession, stream: Stream) -> None:
@@ -141,6 +161,21 @@ async def list_zones(session: AsyncSession, camera_id: int | None = None) -> lis
         stmt = stmt.where(Zone.camera_id == camera_id)
     result = await session.execute(stmt.order_by(Zone.id))
     return list(result.scalars())
+
+
+async def list_zones_for_cameras(session: AsyncSession, camera_ids: list[int]) -> dict[int, list[Zone]]:
+    if not camera_ids:
+        return {}
+
+    result = await session.execute(
+        select(Zone)
+        .where(Zone.camera_id.in_(camera_ids))
+        .order_by(Zone.camera_id, Zone.id)
+    )
+    zones_by_camera: defaultdict[int, list[Zone]] = defaultdict(list)
+    for zone in result.scalars():
+        zones_by_camera[zone.camera_id].append(zone)
+    return dict(zones_by_camera)
 
 
 async def delete_zone(session: AsyncSession, zone: Zone) -> None:
@@ -285,6 +320,35 @@ async def get_latest_frame(session: AsyncSession, camera_id: int) -> Frame | Non
         select(Frame).where(Frame.camera_id == camera_id).order_by(Frame.timestamp.desc()).limit(1)
     )
     return result.scalar_one_or_none()
+
+
+async def get_latest_frames_for_cameras(session: AsyncSession, camera_ids: list[int]) -> dict[int, Frame]:
+    if not camera_ids:
+        return {}
+
+    latest_frame_times = (
+        select(
+            Frame.camera_id.label("camera_id"),
+            func.max(Frame.timestamp).label("max_timestamp"),
+        )
+        .where(Frame.camera_id.in_(camera_ids))
+        .group_by(Frame.camera_id)
+        .subquery()
+    )
+
+    result = await session.execute(
+        select(Frame)
+        .join(
+            latest_frame_times,
+            (Frame.camera_id == latest_frame_times.c.camera_id)
+            & (Frame.timestamp == latest_frame_times.c.max_timestamp),
+        )
+        .order_by(Frame.camera_id, Frame.id.desc())
+    )
+    frames_by_camera: dict[int, Frame] = {}
+    for frame in result.scalars():
+        frames_by_camera.setdefault(frame.camera_id, frame)
+    return frames_by_camera
 
 
 async def get_frames_for_range(

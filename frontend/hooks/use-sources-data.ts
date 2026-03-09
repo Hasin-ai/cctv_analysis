@@ -19,6 +19,7 @@ import {
   uploadVideoSource,
   updateCamera,
 } from "@/lib/api";
+import { usePageVisibility } from "@/hooks/use-page-visibility";
 
 export type SourceStatus = "live" | "paused" | "offline";
 
@@ -139,12 +140,115 @@ function toErrorMessage(error: unknown, fallback: string): string {
   return error instanceof Error ? error.message : fallback;
 }
 
+function sameCameraRows(previous: Camera[], next: Camera[]): boolean {
+  if (previous === next) return true;
+  if (previous.length !== next.length) return false;
+
+  for (let index = 0; index < previous.length; index += 1) {
+    const left = previous[index];
+    const right = next[index];
+    if (
+      left.id !== right.id ||
+      left.name !== right.name ||
+      left.rtsp_url !== right.rtsp_url ||
+      left.location !== right.location ||
+      left.created_at !== right.created_at
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function sameStreamRows(previous: Stream[], next: Stream[]): boolean {
+  if (previous === next) return true;
+  if (previous.length !== next.length) return false;
+
+  for (let index = 0; index < previous.length; index += 1) {
+    const left = previous[index];
+    const right = next[index];
+    if (
+      left.id !== right.id ||
+      left.camera_id !== right.camera_id ||
+      left.port !== right.port ||
+      left.rtsp_url !== right.rtsp_url ||
+      left.status !== right.status ||
+      left.started_at !== right.started_at ||
+      left.stopped_at !== right.stopped_at ||
+      left.last_heartbeat !== right.last_heartbeat
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function sameRealtimeSnapshots(previous: RealtimeCameraSnapshot[], next: RealtimeCameraSnapshot[]): boolean {
+  if (previous === next) return true;
+  if (previous.length !== next.length) return false;
+
+  for (let index = 0; index < previous.length; index += 1) {
+    const left = previous[index];
+    const right = next[index];
+
+    if (
+      left.camera_id !== right.camera_id ||
+      left.camera_name !== right.camera_name ||
+      left.stream_status !== right.stream_status ||
+      left.frame_timestamp !== right.frame_timestamp ||
+      left.has_live_frame !== right.has_live_frame ||
+      left.total_person_count !== right.total_person_count ||
+      left.total_detected_person_count !== right.total_detected_person_count
+    ) {
+      return false;
+    }
+
+    if (left.detection_boxes.length !== right.detection_boxes.length) {
+      return false;
+    }
+    for (let boxIndex = 0; boxIndex < left.detection_boxes.length; boxIndex += 1) {
+      const leftBox = left.detection_boxes[boxIndex];
+      const rightBox = right.detection_boxes[boxIndex];
+      if (
+        leftBox.x1 !== rightBox.x1 ||
+        leftBox.y1 !== rightBox.y1 ||
+        leftBox.x2 !== rightBox.x2 ||
+        leftBox.y2 !== rightBox.y2 ||
+        leftBox.zone_id !== rightBox.zone_id ||
+        leftBox.in_zone !== rightBox.in_zone
+      ) {
+        return false;
+      }
+    }
+
+    if (left.zones.length !== right.zones.length) {
+      return false;
+    }
+    for (let zoneIndex = 0; zoneIndex < left.zones.length; zoneIndex += 1) {
+      const leftZone = left.zones[zoneIndex];
+      const rightZone = right.zones[zoneIndex];
+      if (
+        leftZone.zone_id !== rightZone.zone_id ||
+        leftZone.zone_name !== rightZone.zone_name ||
+        leftZone.person_count !== rightZone.person_count
+      ) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
 export function useSourcesData(options: Options = {}) {
   const {
     pollCoreMs = 12000,
     pollRealtimeMs = 1500,
     enableRealtime = true,
   } = options;
+  const isPageVisible = usePageVisibility();
 
   const [cameras, setCameras] = useState<Camera[]>([]);
   const [streams, setStreams] = useState<Stream[]>([]);
@@ -154,16 +258,29 @@ export function useSourcesData(options: Options = {}) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const coreRefreshRef = useRef<Promise<void> | null>(null);
   const realtimeRefreshRef = useRef<Promise<void> | null>(null);
+  const wasPageVisibleRef = useRef(isPageVisible);
 
   const refreshCore = useCallback(async () => {
-    try {
-      const [cameraRows, streamRows] = await Promise.all([listCameras(), listStreams()]);
-      setCameras(cameraRows);
-      setStreams(streamRows);
-    } catch (err) {
-      setError(toErrorMessage(err, "Failed to refresh camera sources"));
+    if (coreRefreshRef.current) {
+      return coreRefreshRef.current;
     }
+
+    const pending = (async () => {
+      try {
+        const [cameraRows, streamRows] = await Promise.all([listCameras(), listStreams()]);
+        setCameras((previous) => (sameCameraRows(previous, cameraRows) ? previous : cameraRows));
+        setStreams((previous) => (sameStreamRows(previous, streamRows) ? previous : streamRows));
+      } catch (err) {
+        setError(toErrorMessage(err, "Failed to refresh camera sources"));
+      } finally {
+        coreRefreshRef.current = null;
+      }
+    })();
+
+    coreRefreshRef.current = pending;
+    return pending;
   }, []);
 
   const refreshRealtime = useCallback(async () => {
@@ -175,9 +292,13 @@ export function useSourcesData(options: Options = {}) {
     const pending = (async () => {
       try {
         const payload = await getRealtimeMonitoring();
-        setRealtime(payload.cameras);
-        setDetectorAvailable(payload.detector_available);
-        setAnalyticsRunning(payload.analytics_running);
+        setRealtime((previous) => (sameRealtimeSnapshots(previous, payload.cameras) ? previous : payload.cameras));
+        setDetectorAvailable((previous) => (
+          previous === payload.detector_available ? previous : payload.detector_available
+        ));
+        setAnalyticsRunning((previous) => (
+          previous === payload.analytics_running ? previous : payload.analytics_running
+        ));
       } catch {
         // Keep last successful realtime payload to avoid noisy UI on transient errors.
       } finally {
@@ -211,28 +332,39 @@ export function useSourcesData(options: Options = {}) {
     setBusy(true);
     setError("");
     try {
-      await refreshCore();
-      void refreshRealtime();
+      await Promise.all([refreshCore(), refreshRealtime()]);
     } finally {
       setBusy(false);
     }
   }, [refreshCore, refreshRealtime]);
 
   useEffect(() => {
+    if (wasPageVisibleRef.current === isPageVisible) {
+      return;
+    }
+    wasPageVisibleRef.current = isPageVisible;
+    if (!isPageVisible) {
+      return;
+    }
+    void refreshCore();
+    void refreshRealtime();
+  }, [isPageVisible, refreshCore, refreshRealtime]);
+
+  useEffect(() => {
     void refreshAll();
     const id = window.setInterval(() => {
       void refreshCore();
-    }, pollCoreMs);
+    }, isPageVisible ? pollCoreMs : Math.max(pollCoreMs, 60000));
     return () => window.clearInterval(id);
-  }, [pollCoreMs, refreshAll, refreshCore]);
+  }, [isPageVisible, pollCoreMs, refreshAll, refreshCore]);
 
   useEffect(() => {
     if (!enableRealtime) return undefined;
     const id = window.setInterval(() => {
       void refreshRealtime();
-    }, pollRealtimeMs);
+    }, isPageVisible ? pollRealtimeMs : Math.max(pollRealtimeMs, 10000));
     return () => window.clearInterval(id);
-  }, [enableRealtime, pollRealtimeMs, refreshRealtime]);
+  }, [enableRealtime, isPageVisible, pollRealtimeMs, refreshRealtime]);
 
   const streamByCamera = useMemo(() => {
     const map = new Map<number, Stream>();

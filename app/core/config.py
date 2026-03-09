@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -64,6 +65,7 @@ class Settings(BaseSettings):
     facial_expression_detector_backend: str = "opencv"
     facial_expression_realtime_interval_seconds: float = 0.04
     facial_expression_realtime_cache_ttl_seconds: float = 2.0
+    dashboard_overlay_modes: dict[str, dict[str, list[str]]] = Field(default_factory=dict)
 
     model_config = SettingsConfigDict(
         env_prefix="",
