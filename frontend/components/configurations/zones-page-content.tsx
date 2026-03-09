@@ -264,6 +264,7 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
   const [isCanvasFullscreen, setIsCanvasFullscreen] = useState(false);
   const [frameLoadError, setFrameLoadError] = useState("");
   const [frameVersion, setFrameVersion] = useState(0);
+  const [browserWebcamFrameUrl, setBrowserWebcamFrameUrl] = useState("");
 
   const [analyticsMode, setAnalyticsMode] = useState<AnalyticsMode>("person_count");
   const [stagedAnalyticsTypes, setStagedAnalyticsTypes] = useState<AnalyticsMode[]>([]);
@@ -279,10 +280,69 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
     zoneId: null,
     creating: false,
   });
+  const webcamVideoRef = useRef<HTMLVideoElement | null>(null);
+  const webcamStreamRef = useRef<MediaStream | null>(null);
+  const webcamSnapshotCanvasRef = useRef<HTMLCanvasElement | null>(null);
   function setPolygons(shapes: Shape[]) {
     canvasPolygonsRef.current = shapes;
     setCanvasPolygons(shapes);
   }
+
+  const stopBrowserWebcam = useCallback(() => {
+    const stream = webcamStreamRef.current;
+    if (stream) {
+      stream.getTracks().forEach((track) => track.stop());
+      webcamStreamRef.current = null;
+    }
+
+    if (webcamVideoRef.current) {
+      webcamVideoRef.current.srcObject = null;
+    }
+
+    setBrowserWebcamFrameUrl("");
+  }, []);
+
+  const attachBrowserWebcam = useCallback((videoElement: HTMLVideoElement | null) => {
+    const stream = webcamStreamRef.current;
+    if (!videoElement || !stream) return;
+
+    if (videoElement.srcObject !== stream) {
+      videoElement.srcObject = stream;
+    }
+
+    const playPromise = videoElement.play();
+    if (playPromise) {
+      void playPromise.catch(() => {});
+    }
+  }, []);
+
+  const captureBrowserWebcamFrame = useCallback(() => {
+    const video = webcamVideoRef.current;
+    if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || video.videoWidth <= 0 || video.videoHeight <= 0) {
+      setFrameLoadError("Waiting for browser webcam frame...");
+      return false;
+    }
+
+    let canvas = webcamSnapshotCanvasRef.current;
+    if (!canvas) {
+      canvas = document.createElement("canvas");
+      webcamSnapshotCanvasRef.current = canvas;
+    }
+
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+
+    const context = canvas.getContext("2d");
+    if (!context) {
+      setFrameLoadError("Unable to prepare a canvas snapshot from the browser webcam.");
+      return false;
+    }
+
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    setBrowserWebcamFrameUrl(canvas.toDataURL("image/jpeg", 0.92));
+    setFrameLoadError("");
+    return true;
+  }, []);
 
   useEffect(() => {
     if (preferredCameraIdProp && preferredCameraIdProp > 0) {
@@ -326,6 +386,7 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
     if (!selectedCameraId) return null;
     return sources.find((source) => source.camera.id === selectedCameraId) ?? null;
   }, [selectedCameraId, sources]);
+  const isWebcamSource = selectedSource?.type === "Webcam";
 
   const selectedZones = useMemo(() => {
     if (!selectedCameraId) return [];
@@ -348,6 +409,7 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
     if (!selectedCameraId || !selectedSource) return;
     if (analyticsRunning) return;
     if (selectedSource.status !== "live") return;
+    if (selectedSource.type === "Webcam") return;
 
     let cancelled = false;
     void (async () => {
@@ -368,6 +430,76 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
       cancelled = true;
     };
   }, [analyticsRunning, refreshCore, refreshRealtime, selectedCameraId, selectedSource, setNotice]);
+
+  useEffect(() => {
+    if (!selectedCameraId || !isWebcamSource) {
+      stopBrowserWebcam();
+      return;
+    }
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setBrowserWebcamFrameUrl("");
+      setFrameLoadError("This browser cannot access the webcam on the zones page.");
+      return;
+    }
+
+    let cancelled = false;
+    setBrowserWebcamFrameUrl("");
+
+    navigator.mediaDevices
+      .getUserMedia({ video: true, audio: false })
+      .then((stream) => {
+        if (cancelled) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+
+        webcamStreamRef.current = stream;
+        attachBrowserWebcam(webcamVideoRef.current);
+      })
+      .catch((err) => {
+        setBrowserWebcamFrameUrl("");
+        setFrameLoadError(err instanceof Error ? err.message : "Unable to access the browser webcam.");
+      });
+
+    return () => {
+      cancelled = true;
+      stopBrowserWebcam();
+    };
+  }, [attachBrowserWebcam, isWebcamSource, selectedCameraId, stopBrowserWebcam]);
+
+  useEffect(() => {
+    if (!isWebcamSource) return;
+
+    attachBrowserWebcam(webcamVideoRef.current);
+    const video = webcamVideoRef.current;
+    if (!video) return;
+
+    const handleReady = () => {
+      window.requestAnimationFrame(() => {
+        captureBrowserWebcamFrame();
+      });
+    };
+
+    video.addEventListener("loadedmetadata", handleReady);
+    video.addEventListener("canplay", handleReady);
+
+    if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+      handleReady();
+    }
+
+    return () => {
+      video.removeEventListener("loadedmetadata", handleReady);
+      video.removeEventListener("canplay", handleReady);
+    };
+  }, [attachBrowserWebcam, captureBrowserWebcamFrame, isWebcamSource]);
+
+  useEffect(() => {
+    if (!selectedCameraId || !isWebcamSource) return;
+    if (!webcamStreamRef.current) return;
+
+    captureBrowserWebcamFrame();
+  }, [captureBrowserWebcamFrame, frameVersion, isWebcamSource, selectedCameraId]);
 
   const refreshZones = useCallback(
     async (cameraId: number) => {
@@ -562,9 +694,10 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
 
   const frameUrl = useMemo(() => {
     if (!selectedCameraId || !selectedSource) return "";
+    if (isWebcamSource) return browserWebcamFrameUrl;
     const frameEndpoint = isVideoFileSource ? "first-frame" : "source-frame";
     return `/api/backend/api/monitoring/cameras/${selectedCameraId}/${frameEndpoint}?t=${frameVersion}`;
-  }, [frameVersion, isVideoFileSource, selectedCameraId, selectedSource]);
+  }, [browserWebcamFrameUrl, frameVersion, isVideoFileSource, isWebcamSource, selectedCameraId, selectedSource]);
 
   const handleImageSize = useCallback((width: number, height: number) => {
     setImageSize({ width, height });
@@ -577,19 +710,24 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
       setFrameLoadError("No first frame is available yet for this video source.");
       return;
     }
+    if (isWebcamSource) {
+      setFrameLoadError("Unable to load a frame from the browser webcam.");
+      return;
+    }
     setFrameLoadError("Unable to fetch a static frame from the RTSP source.");
-  }, [isVideoFileSource]);
+  }, [isVideoFileSource, isWebcamSource]);
 
   useEffect(() => {
     if (!selectedCameraId) return;
     if (!frameLoadError) return;
     if (imageSize) return;
+    if (isWebcamSource && !webcamStreamRef.current) return;
 
     const id = window.setTimeout(() => {
       setFrameVersion((value) => value + 1);
     }, 2000);
     return () => window.clearTimeout(id);
-  }, [frameLoadError, frameVersion, imageSize, selectedCameraId]);
+  }, [frameLoadError, frameVersion, imageSize, isWebcamSource, selectedCameraId]);
 
   const activatePolygonMode = useCallback(() => {
     setEditMode(false);
@@ -1101,6 +1239,17 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
 
   return (
     <div className="space-y-3">
+      {isWebcamSource ? (
+        <video
+          ref={webcamVideoRef}
+          autoPlay
+          playsInline
+          muted
+          tabIndex={-1}
+          aria-hidden="true"
+          className="pointer-events-none fixed left-[-9999px] top-0 h-px w-px opacity-0"
+        />
+      ) : null}
       <PanelCard
         title="Zone Configuration"
         subtitle="PolygonZone-style drawing on any available captured frame for each camera"
@@ -1333,18 +1482,29 @@ export function ZonesPageContent({ preferredCameraId: preferredCameraIdProp = nu
           {selectedSource ? (
             <div className="space-y-2">
               <div className="overflow-hidden rounded-xl border border-border/70 bg-slate-900/10 p-2">
-                <PolygonCanvas
-                  ref={canvasRef}
-                  imageUrl={frameUrl}
-                  drawMode={drawingTool}
-                  editMode={editMode}
-                  onImageSize={handleImageSize}
-                  onImageError={handleImageError}
-                  onPolygonsChange={setPolygons}
-                  contextPolygons={contextPolygons}
-                  className="w-full"
-                />
+                {frameUrl ? (
+                  <PolygonCanvas
+                    ref={canvasRef}
+                    imageUrl={frameUrl}
+                    drawMode={drawingTool}
+                    editMode={editMode}
+                    onImageSize={handleImageSize}
+                    onImageError={handleImageError}
+                    onPolygonsChange={setPolygons}
+                    contextPolygons={contextPolygons}
+                    className="w-full"
+                  />
+                ) : (
+                  <div className="flex h-[420px] items-center justify-center text-sm text-muted-foreground">
+                    {frameLoadError || (isWebcamSource ? "Waiting for browser webcam frame..." : "Loading image...")}
+                  </div>
+                )}
               </div>
+              {isWebcamSource ? (
+                <p className="text-[11px] text-muted-foreground">
+                  Using the browser webcam for zone drawing because the Dockerized backend cannot read the host webcam device directly.
+                </p>
+              ) : null}
               <div className="flex w-full overflow-x-auto items-stretch rounded-xl border border-border/10 bg-[#8622FF]">
                 <button
                   type="button"

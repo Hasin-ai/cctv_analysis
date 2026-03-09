@@ -1,12 +1,11 @@
 "use client";
 
-import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import type { RealtimeDetectionBox, Zone } from "@/lib/api";
+import { uploadBrowserWebcamFrame, type RealtimeDetectionBox, type Zone } from "@/lib/api";
+import type { SourceStatus } from "@/hooks/use-sources-data";
 import { isZoneFilterSelected } from "@/lib/zone-selection";
 import { cn } from "@/lib/utils";
-import type { SourceStatus } from "@/hooks/use-sources-data";
-
 
 export type AnalyticsMode =
   | "person_count"
@@ -45,7 +44,7 @@ function readZonePolygons(zone: Zone): Array<Array<{ x: number; y: number }>> {
         let x = Number((point as { x?: number }).x);
         let y = Number((point as { y?: number }).y);
         if (Number.isNaN(x) || Number.isNaN(y)) return null;
-        
+
         if (x > 2 || y > 2) {
           x = x / 1920;
           y = y / 1080;
@@ -58,7 +57,7 @@ function readZonePolygons(zone: Zone): Array<Array<{ x: number; y: number }>> {
 
   const rawPolygons = zone.polygon?.polygons;
   if (Array.isArray(rawPolygons)) {
-    return rawPolygons.map(evaluatePoints).filter(poly => poly.length >= 3);
+    return rawPolygons.map(evaluatePoints).filter((poly) => poly.length >= 3);
   }
 
   const legacyPoints = zone.polygon?.points;
@@ -80,7 +79,6 @@ function readLinePoints(zone: Zone, key: "entry_line" | "exit_line"):
   const points = (raw as { points?: unknown }).points;
   if (!Array.isArray(points) || points.length < 2) return null;
 
-  /* If points are mostly between 0 and 1, they are normalized. Otherwise absolute. */
   const parsed = points
     .slice(0, 2)
     .map((point) => {
@@ -89,11 +87,7 @@ function readLinePoints(zone: Zone, key: "entry_line" | "exit_line"):
       let y = Number((point as { y?: number }).y);
       if (Number.isNaN(x) || Number.isNaN(y)) return null;
 
-      // Autodetect if it's not normalized
       if (x > 2 || y > 2) {
-        // Fallback for non-normalized lines, though we prefer normalized data from the API
-        // This prevents the lines from disappearing if coordinates are saved relatively.
-        // We'll scale down assuming a loose max width of 1920 / max height of 1080 for fallback.
         x = x / 1920;
         y = y / 1080;
       }
@@ -109,6 +103,12 @@ function readLinePoints(zone: Zone, key: "entry_line" | "exit_line"):
     x2: parsed[1].x,
     y2: parsed[1].y,
   };
+}
+
+function canvasToJpegBlob(canvas: HTMLCanvasElement, quality = 0.82): Promise<Blob | null> {
+  return new Promise((resolve) => {
+    canvas.toBlob((blob) => resolve(blob), "image/jpeg", quality);
+  });
 }
 
 export function sourceStatusLabel(status: SourceStatus): string {
@@ -182,6 +182,7 @@ export function CameraFeed({
   staticFirstFrame = false,
   zoneId,
   analyticsMode,
+  sourceType,
 }: {
   cameraId: number;
   title: string;
@@ -195,11 +196,23 @@ export function CameraFeed({
   staticFirstFrame?: boolean;
   zoneId?: string;
   analyticsMode?: AnalyticsMode | null;
+  sourceType?: "RTSP" | "Video File" | "Webcam" | string;
 }) {
   const [streamErrored, setStreamErrored] = useState(false);
   const [streamReady, setStreamReady] = useState(false);
+  const [snapshotErrored, setSnapshotErrored] = useState(false);
+  const [browserWebcamReady, setBrowserWebcamReady] = useState(false);
+  const [browserWebcamError, setBrowserWebcamError] = useState("");
   const [snapshotTick, setSnapshotTick] = useState(0);
   const [streamNonce, setStreamNonce] = useState(0);
+  const browserWebcamRef = useRef<HTMLVideoElement | null>(null);
+  const browserWebcamCaptureRef = useRef<HTMLVideoElement | null>(null);
+  const browserWebcamCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const browserWebcamStreamRef = useRef<MediaStream | null>(null);
+  const browserWebcamUploadInFlightRef = useRef(false);
+  const streamLoadedRef = useRef(false);
+  const statusRef = useRef(status);
+  statusRef.current = status;
 
   const activeAnalyticsMode = analyticsMode ?? null;
   const analyticsModeParam = activeAnalyticsMode ? backendAnalyticsMode(activeAnalyticsMode) : null;
@@ -235,28 +248,27 @@ export function CameraFeed({
     snapshotParams.set("zone_id", backendZoneFilter);
   }
   const snapshotUrl = `${snapshotUrlBase}?${snapshotParams.toString()}`;
-  const parsedZones = useMemo(
-    () => {
-      let filteredZones = zones;
-      if (hasZoneFilter) {
-        filteredZones = zones.filter((z) => z.id.toString() === filteredZoneId);
-      }
-      const results = filteredZones.map((zone) => {
-        const polygons = readZonePolygons(zone);
-        if (polygons.length === 0) return null;
 
-        return {
-          id: zone.id,
-          name: zone.name,
-          polygons: polygons,
-          entryLine: readLinePoints(zone, "entry_line"),
-          exitLine: readLinePoints(zone, "exit_line"),
-        };
-      });
-      return results.filter((zone): zone is NonNullable<typeof results[number]> => zone !== null);
-    },
-    [filteredZoneId, hasZoneFilter, zones],
-  );
+  const parsedZones = useMemo(() => {
+    let filteredZones = zones;
+    if (hasZoneFilter) {
+      filteredZones = zones.filter((z) => z.id.toString() === filteredZoneId);
+    }
+    const results = filteredZones.map((zone) => {
+      const polygons = readZonePolygons(zone);
+      if (polygons.length === 0) return null;
+
+      return {
+        id: zone.id,
+        name: zone.name,
+        polygons,
+        entryLine: readLinePoints(zone, "entry_line"),
+        exitLine: readLinePoints(zone, "exit_line"),
+      };
+    });
+    return results.filter((zone): zone is NonNullable<typeof results[number]> => zone !== null);
+  }, [filteredZoneId, hasZoneFilter, zones]);
+
   const parsedDetectionBoxes = useMemo(
     () =>
       detectionBoxes
@@ -302,15 +314,41 @@ export function CameraFeed({
     [detectionBoxes, selectedZoneNumber],
   );
 
-  const streamLoadedRef = useRef(false);
-  const statusRef = useRef(status);
-  statusRef.current = status;
+  const stopBrowserWebcam = useCallback(() => {
+    const stream = browserWebcamStreamRef.current;
+    if (stream) {
+      stream.getTracks().forEach((track) => track.stop());
+      browserWebcamStreamRef.current = null;
+    }
+
+    if (browserWebcamRef.current) {
+      browserWebcamRef.current.srcObject = null;
+    }
+    if (browserWebcamCaptureRef.current) {
+      browserWebcamCaptureRef.current.srcObject = null;
+    }
+
+    setBrowserWebcamReady(false);
+  }, []);
+
+  const attachBrowserWebcam = useCallback((videoElement: HTMLVideoElement | null) => {
+    const stream = browserWebcamStreamRef.current;
+    if (!videoElement || !stream) return;
+
+    if (videoElement.srcObject !== stream) {
+      videoElement.srcObject = stream;
+    }
+
+    const playPromise = videoElement.play();
+    if (playPromise) {
+      void playPromise.catch(() => {});
+    }
+  }, []);
 
   const canUseLiveStream = status === "live" || hasLiveFrame || streamLoadedRef.current;
   const showStream = !staticFirstFrame && canUseLiveStream && !streamErrored;
-  // Keep a still frame visible until the MJPEG stream has actually delivered
-  // its first frame, otherwise the panel goes blank during connect/reconnect.
-  const showSnapshot = staticFirstFrame || !showStream || !streamReady;
+  const showBrowserWebcam = sourceType === "Webcam" && browserWebcamReady && !streamReady;
+  const showSnapshot = !showBrowserWebcam && (staticFirstFrame || !showStream || !streamReady);
   const showFallbackBackground = false;
   const showFrontendPersonBoxes = activeAnalyticsMode === "person_count" || activeAnalyticsMode === "queue";
   const showFrontendZones =
@@ -319,6 +357,7 @@ export function CameraFeed({
     activeAnalyticsMode === "queue" ||
     activeAnalyticsMode === "entry_exit_count";
   const mediaObjectClass = activeAnalyticsMode === "facial_expression" ? "object-cover" : "object-fill";
+  const shouldIngestBrowserWebcam = sourceType === "Webcam" && !staticFirstFrame;
   const shouldRefreshSnapshot =
     showSnapshot &&
     !staticFirstFrame &&
@@ -327,6 +366,7 @@ export function CameraFeed({
   useEffect(() => {
     setStreamErrored(false);
     setStreamReady(false);
+    setSnapshotErrored(false);
     streamLoadedRef.current = false;
   }, [analyticsModeParam, cameraId, staticFirstFrame]);
 
@@ -334,23 +374,143 @@ export function CameraFeed({
     setSnapshotTick(0);
     setStreamNonce((value) => value + 1);
     setStreamReady(false);
+    setSnapshotErrored(false);
     streamLoadedRef.current = false;
   }, [analyticsModeParam, backendZoneFilter, cameraId, staticFirstFrame]);
 
   useEffect(() => {
+    if (sourceType !== "Webcam" || staticFirstFrame) {
+      setBrowserWebcamError("");
+      stopBrowserWebcam();
+      return;
+    }
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setBrowserWebcamError("This browser cannot access the webcam.");
+      setBrowserWebcamReady(false);
+      return;
+    }
+
+    let cancelled = false;
+    setBrowserWebcamError("");
+
+    navigator.mediaDevices
+      .getUserMedia({ video: true, audio: false })
+      .then((stream) => {
+        if (cancelled) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+
+        browserWebcamStreamRef.current = stream;
+        setBrowserWebcamReady(true);
+        attachBrowserWebcam(browserWebcamRef.current);
+        attachBrowserWebcam(browserWebcamCaptureRef.current);
+      })
+      .catch((err) => {
+        setBrowserWebcamReady(false);
+        setBrowserWebcamError(err instanceof Error ? err.message : "Unable to access the browser webcam.");
+      });
+
+    return () => {
+      cancelled = true;
+      stopBrowserWebcam();
+    };
+  }, [attachBrowserWebcam, cameraId, sourceType, staticFirstFrame, stopBrowserWebcam]);
+
+  useEffect(() => {
+    if (sourceType !== "Webcam") return;
+    attachBrowserWebcam(browserWebcamRef.current);
+    attachBrowserWebcam(browserWebcamCaptureRef.current);
+  }, [attachBrowserWebcam, showBrowserWebcam, sourceType]);
+
+  const uploadCurrentBrowserFrame = useCallback(async () => {
+    const videoElement = browserWebcamCaptureRef.current;
+    if (!videoElement || videoElement.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+      return;
+    }
+
+    const frameWidth = videoElement.videoWidth;
+    const frameHeight = videoElement.videoHeight;
+    if (!frameWidth || !frameHeight) {
+      return;
+    }
+
+    let canvas = browserWebcamCanvasRef.current;
+    if (!canvas) {
+      canvas = document.createElement("canvas");
+      browserWebcamCanvasRef.current = canvas;
+    }
+
+    if (canvas.width !== frameWidth) {
+      canvas.width = frameWidth;
+    }
+    if (canvas.height !== frameHeight) {
+      canvas.height = frameHeight;
+    }
+
+    const context = canvas.getContext("2d", { alpha: false });
+    if (!context) {
+      return;
+    }
+
+    context.drawImage(videoElement, 0, 0, frameWidth, frameHeight);
+    const frameBlob = await canvasToJpegBlob(canvas);
+    if (!frameBlob) {
+      return;
+    }
+
+    await uploadBrowserWebcamFrame({
+      cameraId,
+      frame: frameBlob,
+      width: frameWidth,
+      height: frameHeight,
+    });
+  }, [cameraId]);
+
+  useEffect(() => {
+    if (!shouldIngestBrowserWebcam || !browserWebcamReady) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    const uploadFrame = async () => {
+      if (cancelled || browserWebcamUploadInFlightRef.current) {
+        return;
+      }
+
+      browserWebcamUploadInFlightRef.current = true;
+      try {
+        await uploadCurrentBrowserFrame();
+      } catch {
+        // Keep the preview usable while backend ingest reconnects.
+      } finally {
+        browserWebcamUploadInFlightRef.current = false;
+      }
+    };
+
+    void uploadFrame();
+    const id = window.setInterval(() => {
+      void uploadFrame();
+    }, 1000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [browserWebcamReady, shouldIngestBrowserWebcam, uploadCurrentBrowserFrame]);
+
+  useEffect(() => {
     if (!shouldRefreshSnapshot) return undefined;
-    // Use a longer interval to avoid overlapping HTTP requests that cause jitter.
     const id = window.setInterval(() => {
       setSnapshotTick((value) => value + 1);
     }, 1000);
     return () => window.clearInterval(id);
   }, [shouldRefreshSnapshot]);
 
-
   useEffect(() => {
     if (staticFirstFrame || !streamErrored) return undefined;
     const id = window.setTimeout(() => {
-      // Only retry if the source still looks alive
       if (statusRef.current === "live" || streamLoadedRef.current) {
         setStreamErrored(false);
         setStreamNonce((value) => value + 1);
@@ -358,6 +518,18 @@ export function CameraFeed({
     }, 5000);
     return () => window.clearTimeout(id);
   }, [staticFirstFrame, streamErrored]);
+
+  const showStatusMessage =
+    !showBrowserWebcam &&
+    ((!showStream && !showSnapshot) || (showSnapshot && snapshotErrored && !streamReady));
+  const statusMessage =
+    sourceType === "Webcam" && browserWebcamError
+      ? browserWebcamError
+      : sourceType === "Webcam" && snapshotErrored && !streamReady
+        ? "Backend webcam frames are unavailable. Allow browser webcam access to see a live preview here."
+        : status === "live"
+          ? "Waiting for frames..."
+          : "Stream unavailable";
 
   return (
     <div
@@ -374,10 +546,22 @@ export function CameraFeed({
           alt={`${title} latest frame`}
           className={cn("absolute inset-0 h-full w-full", mediaObjectClass)}
           loading="lazy"
-          onLoad={() => {}}
-          onError={() => {
-            // Keep the last successful frame visible to avoid flickering.
+          onLoad={() => {
+            setSnapshotErrored(false);
           }}
+          onError={() => {
+            setSnapshotErrored(true);
+          }}
+        />
+      ) : null}
+
+      {showBrowserWebcam ? (
+        <video
+          ref={browserWebcamRef}
+          autoPlay
+          playsInline
+          muted
+          className={cn("absolute inset-0 h-full w-full", mediaObjectClass)}
         />
       ) : null}
 
@@ -413,15 +597,14 @@ export function CameraFeed({
             <g key={zone.id}>
               {activeAnalyticsMode !== "entry_exit_count" ? (
                 <>
-                  {zone.polygons.map((poly: {x: number, y: number}[], i: number) => (
+                  {zone.polygons.map((poly, index) => (
                     <polygon
-                      key={`${zone.id}-poly-${i}`}
-                      points={poly.map((point: {x: number, y: number}) => `${point.x},${point.y}`).join(" ")}
+                      key={`${zone.id}-poly-${index}`}
+                      points={poly.map((point) => `${point.x},${point.y}`).join(" ")}
                       fill="rgba(20, 184, 166, 0.15)"
                       stroke="rgba(20, 184, 166, 0.98)"
                       strokeWidth="1.2"
                       strokeDasharray="3 2"
-
                     />
                   ))}
                   <text
@@ -462,8 +645,7 @@ export function CameraFeed({
         </svg>
       ) : null}
 
-      {/* In facial-expression mode the backend stream already draws emotion overlays. */}
-      {parsedDetectionBoxes.length > 0 && (showStream || showSnapshot) && showFrontendPersonBoxes ? (
+      {parsedDetectionBoxes.length > 0 && (showStream || showSnapshot || showBrowserWebcam) && showFrontendPersonBoxes ? (
         <>
           {parsedDetectionBoxes.map((box) => (
             <div
@@ -479,11 +661,11 @@ export function CameraFeed({
                 boxShadow: box.inZone ? "0 0 10px rgba(20, 184, 166, 0.3)" : "none",
               }}
             >
-              {box.inZone && (
+              {box.inZone ? (
                 <div className="absolute -top-5 left-0 rounded bg-teal-500/90 px-1.5 py-0.5 text-[0.6rem] font-bold tracking-wider text-white shadow-sm backdrop-blur-md">
                   PERSON
                 </div>
-              )}
+              ) : null}
             </div>
           ))}
         </>
@@ -498,9 +680,24 @@ export function CameraFeed({
         {resolution} • {fps}fps
       </div>
 
-      {!showStream && !showSnapshot ? (
+      {showBrowserWebcam ? (
+        <div className="absolute bottom-2 left-2 rounded-md bg-slate-900/70 px-2 py-1 text-[10px] text-slate-200">
+          Browser webcam preview
+        </div>
+      ) : null}
+
+      <video
+        ref={browserWebcamCaptureRef}
+        autoPlay
+        playsInline
+        muted
+        aria-hidden="true"
+        className="pointer-events-none absolute h-0 w-0 opacity-0"
+      />
+
+      {showStatusMessage ? (
         <div className="absolute inset-0 grid place-items-center text-[11px] text-slate-200/90">
-          {status === "live" ? "Waiting for frames..." : "Stream unavailable"}
+          {statusMessage}
         </div>
       ) : null}
     </div>
@@ -543,9 +740,7 @@ export function MultiZoneLineChart({
 }) {
   const width = 420;
   const height = 110;
-  
-  // Find global max to scale properly across all overlapping graph sets
-  const allValues = series.flatMap(s => s.values);
+  const allValues = series.flatMap((line) => line.values);
   const max = Math.max(...allValues, 1);
   const min = Math.min(...allValues, 0);
   const span = Math.max(max - min, 1);
@@ -555,7 +750,7 @@ export function MultiZoneLineChart({
       <svg viewBox={`0 0 ${width} ${height}`} className={cn("h-[110px] w-full", className)}>
         {series.map((line) => {
           if (line.values.length === 0) return null;
-          
+
           const points = line.values
             .map((value, index) => {
               const x = (index / Math.max(line.values.length - 1, 1)) * width;

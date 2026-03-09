@@ -71,6 +71,14 @@ export type AnalyticsRunState = {
   running: boolean;
 };
 
+export type BrowserFrameIngestResponse = {
+  accepted: boolean;
+  camera_id: number;
+  stream_id: number | null;
+  frame_id: number;
+  frame_timestamp: string;
+};
+
 export type Zone = {
   id: number;
   camera_id: number;
@@ -603,6 +611,27 @@ export async function startAnalyticsRun() {
 export async function stopAnalyticsRun() {
   return request<AnalyticsRunState>("/api/monitoring/analytics/stop", {
     method: "POST",
+  });
+}
+
+export async function uploadBrowserWebcamFrame(input: {
+  cameraId: number;
+  frame: Blob;
+  width?: number;
+  height?: number;
+}) {
+  const formData = new FormData();
+  formData.append("frame", input.frame, `camera-${input.cameraId}-${Date.now()}.jpg`);
+  if (input.width && input.width > 0) {
+    formData.append("width", String(input.width));
+  }
+  if (input.height && input.height > 0) {
+    formData.append("height", String(input.height));
+  }
+
+  return request<BrowserFrameIngestResponse>(`/api/monitoring/cameras/${input.cameraId}/browser-frame`, {
+    method: "POST",
+    body: formData,
   });
 }
 

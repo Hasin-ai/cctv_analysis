@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.controllers import monitoring_controller
 from app.db.session import get_session
-from app.schemas import AnalyticsRunState, MonitoringResponse, RealtimeMonitoringResponse
+from app.schemas import AnalyticsRunState, BrowserFrameIngestResponse, MonitoringResponse, RealtimeMonitoringResponse
 
 router = APIRouter(prefix="/monitoring", tags=["monitoring"])
 
@@ -64,6 +64,24 @@ async def source_camera_frame(
     session: AsyncSession = Depends(get_session),
 ):
     return await monitoring_controller.source_frame(session, camera_id)
+
+
+@router.post("/cameras/{camera_id}/browser-frame", response_model=BrowserFrameIngestResponse)
+async def ingest_browser_camera_frame(
+    camera_id: int,
+    frame: UploadFile = File(...),
+    width: int | None = Form(default=None),
+    height: int | None = Form(default=None),
+    session: AsyncSession = Depends(get_session),
+):
+    payload = await frame.read()
+    return await monitoring_controller.ingest_browser_frame(
+        session,
+        camera_id,
+        payload,
+        width=width,
+        height=height,
+    )
 
 
 @router.get("/cameras/{camera_id}/facial-expression/realtime")

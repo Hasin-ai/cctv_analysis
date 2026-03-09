@@ -826,6 +826,8 @@ async def realtime(session: AsyncSession, camera_ids: list[int] | None = None):
             detection_boxes = result.get("detection_boxes", [])
             total_people_in_zones = int(result.get("total_in_zones", 0))
             total_detected_people = int(result.get("total_detected", total_people_in_zones))
+            if not zones:
+                total_people_in_zones = total_detected_people
         else:
             zone_counts = {zone.id: 0 for zone in zones}
             detection_boxes = []
@@ -1041,6 +1043,53 @@ def _capture_rtsp_source_frame(rtsp_url: str) -> bytes:
     return result.stdout
 
 
+def _capture_webcam_source_frame(webcam_id: str) -> bytes:
+    import sys
+    
+    cmd = [
+        settings.ffmpeg_path,
+        "-hide_banner",
+        "-loglevel", "error",
+    ]
+    
+    if sys.platform == "darwin":
+        cmd.extend(["-f", "avfoundation", "-framerate", "30", "-i", webcam_id])
+    elif sys.platform.startswith("linux"):
+        cmd.extend(["-f", "v4l2", "-framerate", "30", "-i", f"/dev/video{webcam_id}"])
+    elif sys.platform == "win32":
+        cmd.extend(["-f", "dshow", "-i", f"video={webcam_id}"])
+    else:
+        cmd.extend(["-i", webcam_id])
+        
+    cmd.extend([
+        "-frames:v", "1",
+        "-q:v", "2",
+        "-f", "image2pipe",
+        "-vcodec", "mjpeg",
+        "pipe:1"
+    ])
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            check=False,
+            timeout=5.0,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail=f"ffmpeg binary not found: {settings.ffmpeg_path}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(status_code=504, detail="Timed out while capturing a frame from webcam.") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Failed to capture Webcam frame: {exc}") from exc
+
+    if result.returncode != 0 or not result.stdout:
+        print(f"DEBUG ffmpeg capture failed! returncode={result.returncode}, stderr={result.stderr}")
+        detail = (result.stderr or b"").decode(errors="ignore").strip().splitlines()[-1] if result.stderr else "ffmpeg returned non-zero status"
+        raise HTTPException(status_code=502, detail=f"Failed to capture Webcam frame: {detail}")
+    return result.stdout
+
+
 async def source_frame(session: AsyncSession, camera_id: int):
     camera = await crud.get_camera(session, camera_id)
     if not camera:
@@ -1051,6 +1100,24 @@ async def source_frame(session: AsyncSession, camera_id: int):
         raise HTTPException(status_code=400, detail="Camera source URL required")
 
     scheme = urlparse(source_url).scheme.lower()
+    print(f"DEBUG: source_frame called for camera {camera_id}")
+    print(f"DEBUG: source_url: {source_url}, scheme: {scheme}")
+    
+    if scheme == "webcam":
+        parsed = urlparse(source_url)
+        webcam_id = parsed.netloc or parsed.path or "0"
+        print(f"DEBUG: Selected webcam id: {webcam_id}")
+        payload = await asyncio.to_thread(_capture_webcam_source_frame, webcam_id)
+        return Response(
+            content=payload,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
+        
     if scheme in {"rtsp", "rtsps"}:
         payload = await asyncio.to_thread(_capture_rtsp_source_frame, resolve_rtsp_url(source_url))
         return Response(
@@ -1067,8 +1134,66 @@ async def source_frame(session: AsyncSession, camera_id: int):
 
     raise HTTPException(
         status_code=400,
-        detail="Unsupported camera source URL. Use rtsp://, rtsps://, or file://",
+        detail="Unsupported camera source URL. Use rtsp://, rtsps://, file://, or webcam://",
     )
+
+
+async def ingest_browser_frame(
+    session: AsyncSession,
+    camera_id: int,
+    payload: bytes,
+    *,
+    width: int | None = None,
+    height: int | None = None,
+) -> dict[str, Any]:
+    camera = await crud.get_camera(session, camera_id)
+    if not camera:
+        raise HTTPException(status_code=404, detail="Camera not found")
+
+    source_url = (camera.rtsp_url or "").strip()
+    scheme = urlparse(source_url).scheme.lower()
+    if scheme != "webcam":
+        raise HTTPException(
+            status_code=400,
+            detail="Browser frame ingest is only supported for webcam sources.",
+        )
+
+    if not payload:
+        raise HTTPException(status_code=400, detail="Uploaded frame is empty.")
+
+    stream = await crud.get_stream_by_camera(session, camera_id)
+    if not stream:
+        stream = await crud.create_stream(session, camera_id, None)
+
+    frame_timestamp = datetime.utcnow()
+    frame_width = int(width) if width and width > 0 else None
+    frame_height = int(height) if height and height > 0 else None
+    base_dir = Path(settings.frames_dir) / f"camera_{camera_id}" / f"stream_{stream.id}"
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    frame_name = f"browser_{frame_timestamp.strftime('%Y%m%d%H%M%S%f')}.jpg"
+    frame_path = base_dir / frame_name
+    await asyncio.to_thread(frame_path.write_bytes, payload)
+
+    frame = await crud.create_frame(
+        session,
+        camera_id=camera_id,
+        stream_id=stream.id,
+        path=str(frame_path),
+        timestamp=frame_timestamp,
+        width=frame_width,
+        height=frame_height,
+        size_bytes=len(payload),
+    )
+    await crud.update_stream_heartbeat(session, stream, frame_timestamp)
+
+    return {
+        "accepted": True,
+        "camera_id": camera_id,
+        "stream_id": stream.id,
+        "frame_id": frame.id,
+        "frame_timestamp": frame.timestamp.isoformat() if frame.timestamp else frame_timestamp.isoformat(),
+    }
 
 
 async def mjpeg_stream(

@@ -1,10 +1,13 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   type ZoneAnalysisResponse,
   getZoneAnalysis,
+  listAnalyzerCameras,
+  listAnalyzerJobs,
+  runAnalyzerAnalysis,
 } from "@/lib/api";
 import { usePageVisibility } from "@/hooks/use-page-visibility";
 import { parseSelectedZoneId } from "@/lib/zone-selection";
@@ -27,6 +30,35 @@ function staffRatioPercent(value: number): string {
   return `${Math.round(value * 100)}%`;
 }
 
+function hasMeaningfulZoneAnalysis(payload: ZoneAnalysisResponse): boolean {
+  if ((payload.summary?.tracked_paths ?? 0) > 0) return true;
+  if ((payload.summary?.estimated_person_tracks ?? 0) > 0) return true;
+  if ((payload.summary?.estimated_staff_tracks ?? 0) > 0) return true;
+  if (payload.congestion_by_zone.some((zone) => zone.current_count > 0 || zone.peak_count > 0 || zone.avg_count > 0)) {
+    return true;
+  }
+  if (payload.heatmaps.some((heatmap) => heatmap.max_cell_count > 0)) return true;
+  if (
+    payload.service_staff_presence.some(
+      (zone) =>
+        zone.person_tracks > 0 ||
+        zone.staff_tracks > 0 ||
+        zone.person_presence_seconds > 0 ||
+        zone.staff_presence_seconds > 0,
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function isAnalyzerJobRecent(job: { status: string; created_at: string }): boolean {
+  if (job.status === "running" || job.status === "pending") return true;
+  const createdAt = new Date(job.created_at).getTime();
+  if (Number.isNaN(createdAt)) return false;
+  return Date.now() - createdAt < 2 * 60 * 1000;
+}
+
 export function ZoneAnalysisPanel({
   cameraId,
   selectedZoneId = "",
@@ -38,25 +70,70 @@ export function ZoneAnalysisPanel({
 }) {
   const [data, setData] = useState<ZoneAnalysisResponse | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [latestJobStatus, setLatestJobStatus] = useState<string | null>(null);
+  const triggerAttemptedRef = useRef(false);
   const isPageVisible = usePageVisibility();
+
+  const autoTriggerJob = useCallback(
+    async (zoneId: number | undefined) => {
+      if (triggerAttemptedRef.current) return;
+      triggerAttemptedRef.current = true;
+
+      const cameras = await listAnalyzerCameras();
+      const camera = cameras.find((row) => row.id === cameraId);
+      if (!camera?.first_frame_time || !camera?.latest_frame_time) {
+        throw new Error("No captured CCTV frames are available yet for zone analysis.");
+      }
+
+      const startTime = new Date(
+        camera.first_frame_time.endsWith("Z") ? camera.first_frame_time : `${camera.first_frame_time}Z`,
+      );
+      const endTime = new Date(
+        camera.latest_frame_time.endsWith("Z") ? camera.latest_frame_time : `${camera.latest_frame_time}Z`,
+      );
+
+      await runAnalyzerAnalysis({
+        camera_id: cameraId,
+        zone_id: zoneId,
+        start: startTime.toISOString(),
+        end: endTime.toISOString(),
+      });
+    },
+    [cameraId],
+  );
 
   useEffect(() => {
     if (!isPageVisible) return undefined;
     let active = true;
+    triggerAttemptedRef.current = false;
 
     async function load() {
       try {
         const zoneId = parseSelectedZoneId(selectedZoneId) ?? undefined;
+        const existingJobs = await listAnalyzerJobs(cameraId);
+        const latestJob = existingJobs[0] ?? null;
+
+        if (!latestJob || !isAnalyzerJobRecent(latestJob)) {
+          await autoTriggerJob(zoneId);
+        }
+
+        const refreshedJobs = await listAnalyzerJobs(cameraId);
+        const currentJob = refreshedJobs[0] ?? latestJob;
         const payload = await getZoneAnalysis({
           cameraId,
           zoneId,
           start,
         });
         if (!active) return;
+        setLatestJobStatus(currentJob?.status ?? null);
         setData(payload);
-      } catch {
+        setError(null);
+      } catch (err) {
         if (!active) return;
         setData(null);
+        setLatestJobStatus(null);
+        setError(err instanceof Error ? err.message : "Failed to load zone analysis.");
       } finally {
         if (!active) return;
         setLoading(false);
@@ -72,14 +149,31 @@ export function ZoneAnalysisPanel({
       active = false;
       window.clearInterval(id);
     };
-  }, [cameraId, isPageVisible, selectedZoneId, start]);
+  }, [autoTriggerJob, cameraId, isPageVisible, selectedZoneId, start]);
 
   if (loading && !data) {
     return <p className="text-sm text-muted-foreground">Loading zone analysis...</p>;
   }
 
+  if (latestJobStatus === "pending" || latestJobStatus === "running") {
+    return <p className="text-sm text-muted-foreground">Zone analysis is running on the latest CCTV frames...</p>;
+  }
+
+  if (error) {
+    return <p className="text-sm text-muted-foreground">{error}</p>;
+  }
+
   if (!data) {
     return <p className="text-sm text-muted-foreground">Zone analysis is not available yet for this camera.</p>;
+  }
+
+  if (!hasMeaningfulZoneAnalysis(data)) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        No completed zone-analysis results are available yet for this camera. Start analytics from Zone Configuration or wait
+        for the current analyzer job to finish.
+      </p>
+    );
   }
 
   return (

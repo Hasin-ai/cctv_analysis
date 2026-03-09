@@ -252,3 +252,11 @@ class RealtimeMonitoringResponse(BaseModel):
 
 class AnalyticsRunState(BaseModel):
     running: bool
+
+
+class BrowserFrameIngestResponse(BaseModel):
+    accepted: bool = True
+    camera_id: int
+    stream_id: int | None = None
+    frame_id: int
+    frame_timestamp: str

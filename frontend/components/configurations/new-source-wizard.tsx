@@ -1,6 +1,6 @@
 "use client";
 
-import { type ChangeEvent, type DragEvent, useEffect, useMemo, useRef, useState } from "react";
+import { type ChangeEvent, type DragEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Check, Upload } from "lucide-react";
 import { useRouter } from "next/navigation";
 
@@ -94,6 +94,84 @@ export function NewSourceWizard({ onWizardComplete }: { onWizardComplete?: (comp
   // New state to hold the saved camera for Step 4
   const [savedCamera, setSavedCamera] = useState<{ id: number; name: string } | null>(null);
 
+  const [webcamError, setWebcamError] = useState<string>("");
+  const videoPreviewRef = useRef<HTMLVideoElement | null>(null);
+  const webcamKeepAliveRef = useRef<HTMLVideoElement | null>(null);
+  const webcamStreamRef = useRef<MediaStream | null>(null);
+
+  const stopWebcamStream = useCallback(() => {
+    const stream = webcamStreamRef.current;
+    if (!stream) return;
+
+    stream.getTracks().forEach((track) => track.stop());
+    webcamStreamRef.current = null;
+
+    if (videoPreviewRef.current) {
+      videoPreviewRef.current.srcObject = null;
+    }
+    if (webcamKeepAliveRef.current) {
+      webcamKeepAliveRef.current.srcObject = null;
+    }
+  }, []);
+
+  const attachWebcamStream = useCallback((videoElement: HTMLVideoElement | null) => {
+    const stream = webcamStreamRef.current;
+    if (!videoElement || !stream) return;
+
+    if (videoElement.srcObject !== stream) {
+      videoElement.srcObject = stream;
+    }
+
+    const playPromise = videoElement.play();
+    if (playPromise) {
+      void playPromise.catch(() => {});
+    }
+  }, []);
+
+  useEffect(() => {
+    setWebcamError("");
+    if (sourceType !== "webcam") {
+      stopWebcamStream();
+      return;
+    }
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setWebcamError("Your browser does not support accessing the webcam (or requires HTTPS).");
+      return;
+    }
+
+    let cancelled = false;
+
+    navigator.mediaDevices
+      .getUserMedia({ video: true, audio: false })
+      .then((stream) => {
+        if (cancelled) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+
+        webcamStreamRef.current = stream;
+        attachWebcamStream(videoPreviewRef.current);
+        attachWebcamStream(webcamKeepAliveRef.current);
+      })
+      .catch((err) => {
+        console.error("Failed to access webcam:", err);
+        setWebcamError(err instanceof Error ? err.message : String(err));
+      });
+
+    return () => {
+      cancelled = true;
+      stopWebcamStream();
+    };
+  }, [attachWebcamStream, sourceType, stopWebcamStream]);
+
+  useEffect(() => {
+    if (sourceType !== "webcam") return;
+
+    attachWebcamStream(webcamKeepAliveRef.current);
+    attachWebcamStream(videoPreviewRef.current);
+  }, [attachWebcamStream, sourceType, step]);
+
   const initializedRef = useRef(false);
   const editingCamera = useMemo(
     () => (editingId ? cameras.find((camera) => camera.id === editingId) ?? null : null),
@@ -132,7 +210,7 @@ export function NewSourceWizard({ onWizardComplete }: { onWizardComplete?: (comp
   function stepOneValid() {
     if (!sourceName.trim()) return false;
     if (sourceType === "rtsp") return isRtspLikeUrl(rtspUrl);
-    if (sourceType === "webcam") return webcamId.trim().length > 0;
+    if (sourceType === "webcam") return true;
     if (videoFile) return true;
     return Boolean(editingId && fileName.trim().length > 0);
   }
@@ -197,6 +275,17 @@ export function NewSourceWizard({ onWizardComplete }: { onWizardComplete?: (comp
 
   return (
     <div className="space-y-3">
+      {sourceType === "webcam" ? (
+        <video
+          ref={webcamKeepAliveRef}
+          autoPlay
+          playsInline
+          muted
+          tabIndex={-1}
+          aria-hidden="true"
+          className="pointer-events-none fixed left-[-9999px] top-0 h-px w-px opacity-0"
+        />
+      ) : null}
       <PanelCard
         title={editingId ? "Edit Source" : "Add New Source"}
         subtitle="Three-step wizard for source setup and processing schedule"
@@ -280,15 +369,29 @@ export function NewSourceWizard({ onWizardComplete }: { onWizardComplete?: (comp
                 <p className="mt-1 text-[11px] text-muted-foreground">Supports `rtsp://` and `rtsps://` URLs.</p>
               </div>
             ) : sourceType === "webcam" ? (
-              <div>
-                <label className="mb-1 block text-xs font-semibold text-muted-foreground">Webcam Device Index or Path</label>
-                <input
-                  value={webcamId}
-                  onChange={(event) => setWebcamId(event.target.value)}
-                  placeholder="0 or /dev/video0"
-                  className="h-10 w-full rounded-lg border border-input bg-white px-3 text-sm text-foreground outline-none"
-                />
-                <p className="mt-1 text-[11px] text-muted-foreground">E.g., `0` for default Mac webcam, `/dev/video0` on Linux.</p>
+              <div className="space-y-3">
+                {webcamError && (
+                  <div className="rounded-lg border border-red-500/50 bg-red-500/10 p-3 text-sm text-red-600">
+                    <strong>Webcam Error:</strong> {webcamError}
+                  </div>
+                )}
+                <div>
+                  <label className="mb-1 block text-xs font-semibold text-muted-foreground">Live Preview</label>
+                  <div className="overflow-hidden rounded-lg border border-border bg-black relative flex items-center justify-center min-h-[200px]">
+                    {!webcamError && (
+                      <video
+                        ref={videoPreviewRef}
+                        autoPlay
+                        playsInline
+                        muted
+                        className="h-[200px] w-full object-contain"
+                      />
+                    )}
+                    {webcamError && (
+                       <p className="text-xs text-muted-foreground">Preview unavailable</p>
+                    )}
+                  </div>
+                </div>
               </div>
             ) : (
               <label
@@ -308,13 +411,12 @@ export function NewSourceWizard({ onWizardComplete }: { onWizardComplete?: (comp
                 <p className="mt-2 text-sm font-semibold text-foreground">Drop video here or click to select</p>
                 <p className="mt-1 text-xs text-muted-foreground">{fileName || "No file selected"}</p>
                 <p className="mt-2 text-[11px] text-muted-foreground">
-                  Uploads are sent to backend storage and synced as a camera source.
                 </p>
                 <input type="file" accept="video/*" onChange={handleFileChange} className="hidden" />
               </label>
             )}
 
-            <div className="flex justify-end">
+            <div className="flex justify-end mt-4">
               <button
                 type="button"
                 disabled={!stepOneValid()}

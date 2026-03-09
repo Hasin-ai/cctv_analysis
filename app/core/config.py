@@ -2,8 +2,40 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PATH_FIELDS = (
+    "segments_dir",
+    "frames_dir",
+    "uploads_dir",
+    "reconstructions_dir",
+    "config_backup_path",
+    "yolo_model_path",
+    "boxmot_reid_weights",
+    "personvit_reid_weights",
+    "facial_expression_model_path",
+)
+
+
+def _resolve_project_path(raw: str) -> str:
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = (PROJECT_ROOT / candidate).resolve()
+    return str(candidate)
+
+
+def _normalize_sqlite_url(raw: str) -> str:
+    for prefix in ("sqlite+aiosqlite:///", "sqlite:///"):
+        if not raw.startswith(prefix):
+            continue
+        path = raw[len(prefix) :]
+        if path and not path.startswith("/"):
+            return f"{prefix}{_resolve_project_path(path)}"
+        return raw
+    return raw
 
 
 class Settings(BaseSettings):
@@ -32,12 +64,12 @@ class Settings(BaseSettings):
     retention_days: int = 7
     config_backup_path: str = "./data/config-backup.json"
     analytics_use_yolo: bool = True
-    yolo_model_path: str = "/Users/bs00851/Documents/cctv_analysis/data/models/yolo26x.pt"
+    yolo_model_path: str = "./data/models/yolo26x.pt"
     yolo_confidence: float = 0.3
     yolo_iou: float = 0.5
     yolo_tracker: str = "botsort.yaml"
     yolo_verbose: bool = False
-    boxmot_reid_weights: str = "osnet_x0_25_msmt17.pt"
+    boxmot_reid_weights: str = "./data/models/osnet_x0_25_msmt17.pt"
     boxmot_device: str = "cpu"
     strongsort_min_hits: int = 1
     strongsort_n_init: int = 1
@@ -69,9 +101,23 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(
         env_prefix="",
-        env_file=".env",
+        env_file=str(PROJECT_ROOT / ".env"),
         extra="ignore",
     )
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def normalize_database_url(cls, value: object) -> object:
+        if value in (None, ""):
+            return value
+        return _normalize_sqlite_url(str(value))
+
+    @field_validator(*PATH_FIELDS, mode="before")
+    @classmethod
+    def normalize_path_fields(cls, value: object) -> object:
+        if value in (None, ""):
+            return value
+        return _resolve_project_path(str(value))
 
 
 settings = Settings()

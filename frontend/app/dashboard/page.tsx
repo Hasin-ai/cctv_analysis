@@ -516,7 +516,7 @@ export default function DashboardPage() {
       for (const source of sources) {
         if (!source.realtime) continue;
         // If a specific zone is selected, use that zone's live counts for the timeline
-        let currentPerson = source.realtime.total_person_count;
+        let currentPerson = source.realtime.total_detected_person_count;
         const zoneId = parseSelectedZoneId(deferredSelectedZoneId);
 
         if (zoneId !== null) {
@@ -847,6 +847,7 @@ export default function DashboardPage() {
                   cameraId={selected.camera.id}
                   title={selected.camera.name}
                   status={selected.status}
+                  sourceType={selected.type}
                   resolution={selected.resolution}
                   fps={selected.fps}
                   zones={zonesByCamera[selected.camera.id] ?? []}

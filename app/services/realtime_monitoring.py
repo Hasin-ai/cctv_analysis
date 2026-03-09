@@ -191,19 +191,20 @@ class RealtimeMonitoringService:
             xyxy = self._np.empty((0, 4), dtype=self._np.float32)
 
         detection_boxes: list[dict[str, Any]] = []
+        total_detected = 0
         for row in xyxy:
             if len(row) < 4:
                 continue
             x1, y1, x2, y2 = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+            total_detected += 1
             zone_id = _resolve_zone_for_bbox(x1, y1, x2, y2, polygons, zones)
+            detection_box = _normalize_detection_box(x1, y1, x2, y2, frame_w, frame_h, zone_id)
+            if detection_box is not None:
+                detection_boxes.append(detection_box)
             if zone_id is not None:
-                detection_box = _normalize_detection_box(x1, y1, x2, y2, frame_w, frame_h, zone_id)
-                if detection_box is not None:
-                    detection_boxes.append(detection_box)
                 zone_counts[zone_id] = int(zone_counts.get(zone_id, 0)) + 1
 
         total_in_zones = int(sum(zone_counts.values()))
-        total_detected = total_in_zones
         return {
             "available": True,
             "total_detected": total_detected,

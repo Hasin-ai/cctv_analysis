@@ -34,6 +34,12 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+Optional: start from the checked-in defaults and override only what you need.
+
+```bash
+cp .env.example .env
+```
+
 2. Ensure FFmpeg is installed and available:
 
 ```bash
@@ -70,18 +76,27 @@ NEXT_PUBLIC_API_BASE=http://127.0.0.1:8000 npm run dev
 
 ## Configuration
 
-Main environment variables:
+The backend reads `.env` from the repo root. Relative filesystem paths are resolved from the repo root locally and from `/app` in Docker.
 
-- `DATABASE_URL=sqlite+aiosqlite:///./data/app.db`
+Common environment variables:
+
+- `DATABASE_URL` defaults to SQLite at `./data/app.db`
 - `SERVICE_ROLE=fetcher|all`
 - `FFMPEG_PATH=ffmpeg`
 - `FFMPEG_LOG_LEVEL=error`
 - `FFMPEG_RTSP_TRANSPORT=tcp`
 - `FRAMES_DIR=./data/frames`
-- `FRAME_INTERVAL_SECONDS=2.0`
-- `SEGMENT_SCAN_SECONDS=1.0`
-- `RTSP_INTERNAL_HOST=`
+- `SEGMENTS_DIR=./data/segments`
+- `UPLOADS_DIR=./data/uploads`
+- `RECONSTRUCTIONS_DIR=./data/reconstructions`
+- `FRAME_INTERVAL_SECONDS=0.04`
+- `SEGMENT_SCAN_SECONDS=0.04`
+- `RTSP_INTERNAL_HOST=` locally, `host.docker.internal` in Docker Compose by default
 - `RTSP_INTERNAL_PORT=0`
+- `YOLO_MODEL_PATH=./data/models/yolo26x.pt`
+- `BOXMOT_REID_WEIGHTS=./data/models/osnet_x0_25_msmt17.pt`
+- `PERSONVIT_REID_WEIGHTS=./data/models/personvit/checkpoint0260.pth`
+- `NEXT_PUBLIC_API_BASE=http://backend:8000` in Docker, `http://127.0.0.1:8000` for local `npm run dev`
 
 ## API Overview
 

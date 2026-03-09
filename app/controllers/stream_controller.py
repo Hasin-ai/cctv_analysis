@@ -196,7 +196,8 @@ def _resolve_capture_source(source_url: str) -> tuple[str, str]:
     if scheme == "file":
         return "file", _file_path_from_uri(source_url)
     if scheme == "webcam":
-        return "webcam", str(parsed.netloc or "0")
+        device_id = parsed.netloc or parsed.path or "0"
+        return "webcam", str(device_id)
 
     raise HTTPException(
         status_code=400,
