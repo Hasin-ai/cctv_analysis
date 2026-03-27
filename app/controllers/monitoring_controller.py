@@ -412,7 +412,9 @@ async def _get_facial_detections_for_frame(
     *,
     non_blocking: bool = False,
 ) -> list[dict[str, Any]]:
-    # Facial-expression mode is zone-scoped only; if no valid zone filter exists, skip overlay.
+    # Facial-expression detection requires a valid zone filter. Both callers already resolve
+    # the zone filter from the database before calling this function, so if zone is still None
+    # here, there truly are no configured zones and we can skip detection safely.
     if zone is None:
         return []
 

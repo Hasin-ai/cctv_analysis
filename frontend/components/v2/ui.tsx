@@ -218,8 +218,24 @@ export function CameraFeed({
   const analyticsModeParam = activeAnalyticsMode ? backendAnalyticsMode(activeAnalyticsMode) : null;
   const hasZoneFilter = isZoneFilterSelected(zoneId);
   const filteredZoneId = hasZoneFilter ? zoneId ?? "" : "";
-  const backendZoneFilter =
-    hasZoneFilter && activeAnalyticsMode && shouldUseBackendZoneFilter(activeAnalyticsMode) ? filteredZoneId : "";
+
+  // For facial_expression mode, if no zone is explicitly selected, automatically fall back to the
+  // first configured zone. Without a zone, the backend skips DeepFace detection entirely.
+  const facialExpressionFallbackZoneId = useMemo(() => {
+    if (activeAnalyticsMode !== "facial_expression") return "";
+    if (hasZoneFilter) return "";
+    const firstZone = zones.find((z) => z.id);
+    return firstZone ? String(firstZone.id) : "";
+  }, [activeAnalyticsMode, hasZoneFilter, zones]);
+
+  const backendZoneFilter = useMemo(() => {
+    if (!activeAnalyticsMode || !shouldUseBackendZoneFilter(activeAnalyticsMode)) return "";
+    if (hasZoneFilter) return filteredZoneId;
+    // For facial_expression: use fallback first zone if no zone is selected
+    if (activeAnalyticsMode === "facial_expression") return facialExpressionFallbackZoneId;
+    return "";
+  }, [activeAnalyticsMode, facialExpressionFallbackZoneId, filteredZoneId, hasZoneFilter]);
+
   const selectedZoneNumber = hasZoneFilter ? Number(filteredZoneId) : null;
 
   const streamUrlBase = `/api/stream/cameras/${cameraId}/stream.mjpg`;
